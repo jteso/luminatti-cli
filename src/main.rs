@@ -1,0 +1,2166 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    hash::{Hash, Hasher},
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+use arboard::Clipboard;
+use clap::Parser;
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
+    },
+};
+use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
+use uuid::Uuid;
+
+#[derive(Parser, Debug)]
+#[command(version, about = "Fast line-aligned worktree diff review")]
+struct Cli {
+    /// Directory inside the Git worktree to review
+    #[arg(default_value = ".")]
+    dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct FileItem {
+    path: String,
+    status: String,
+}
+
+#[derive(Default)]
+struct TreeNode {
+    children: BTreeMap<String, TreeNode>,
+    file_index: Option<usize>,
+}
+
+#[derive(Clone)]
+struct TreeRow {
+    path: String,
+    depth: usize,
+    file_index: Option<usize>,
+    expanded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DiffRow {
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    old_text: String,
+    new_text: String,
+    old_changed: bool,
+    new_changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightTab {
+    Diff,
+    Comments,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterTab {
+    Filters,
+    Ignored,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Files,
+    Right,
+    Filters,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffMode {
+    SideBySide,
+    Unified,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputKind {
+    Comment,
+    Filter,
+    FileSearch,
+}
+
+#[derive(Debug)]
+struct Input {
+    kind: InputKind,
+    value: String,
+    selected: usize,
+}
+
+#[derive(Default)]
+struct RemoteStatus {
+    branch: String,
+    behind: Option<u32>,
+    ahead: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewComment {
+    #[serde(default = "new_id")]
+    id: String,
+    file_path: String,
+    #[serde(default)]
+    old_line: Option<u32>,
+    #[serde(default)]
+    new_line: Option<u32>,
+    #[serde(default)]
+    hunk: Option<u32>,
+    summary: String,
+    #[serde(default)]
+    rationale: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default = "local_source")]
+    source: String,
+}
+fn new_id() -> String {
+    format!("luminatti:{}", Uuid::new_v4())
+}
+fn local_source() -> String {
+    "user".into()
+}
+
+#[derive(Serialize, Deserialize)]
+struct CommentStore {
+    #[serde(default = "store_version")]
+    version: u32,
+    #[serde(default)]
+    comments: Vec<ReviewComment>,
+}
+impl Default for CommentStore {
+    fn default() -> Self {
+        Self {
+            version: store_version(),
+            comments: vec![],
+        }
+    }
+}
+fn store_version() -> u32 {
+    1
+}
+#[derive(Serialize, Deserialize)]
+struct FilterStore {
+    #[serde(default = "store_version")]
+    version: u32,
+    #[serde(default)]
+    patterns: Vec<String>,
+}
+impl Default for FilterStore {
+    fn default() -> Self {
+        Self {
+            version: store_version(),
+            patterns: vec![],
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(untagged)]
+enum AgentCommentFile {
+    #[default]
+    Empty,
+    Store {
+        #[serde(default)]
+        comments: Vec<ReviewComment>,
+    },
+    List(Vec<ReviewComment>),
+}
+
+struct App {
+    repo: PathBuf,
+    files: Vec<FileItem>,
+    ignored_files: Vec<FileItem>,
+    filters: FilterStore,
+    local_comments: CommentStore,
+    agent_comments: Vec<ReviewComment>,
+    right_tab: RightTab,
+    filter_tab: FilterTab,
+    focus: Focus,
+    diff_mode: DiffMode,
+    show_unchanged: bool,
+    selected_file: usize,
+    selected_filter: usize,
+    selected_ignored: usize,
+    selected_comment: usize,
+    selected_row: usize,
+    collapsed_dirs: BTreeSet<String>,
+    divider: u16,
+    dragging_divider: bool,
+    diff_rows: Vec<DiffRow>,
+    diff_scroll: u16,
+    diff_signature: Option<u64>,
+    input: Option<Input>,
+    show_help: bool,
+    message: String,
+    remote: RemoteStatus,
+    last_refresh: Instant,
+}
+
+impl App {
+    fn new(repo: PathBuf) -> Result<Self> {
+        let mut app = Self {
+            repo,
+            files: vec![],
+            ignored_files: vec![],
+            filters: FilterStore::default(),
+            local_comments: CommentStore::default(),
+            agent_comments: vec![],
+            right_tab: RightTab::Diff,
+            filter_tab: FilterTab::Filters,
+            focus: Focus::Files,
+            diff_mode: DiffMode::SideBySide,
+            show_unchanged: false,
+            selected_file: 0,
+            selected_filter: 0,
+            selected_ignored: 0,
+            selected_comment: 0,
+            selected_row: 0,
+            collapsed_dirs: BTreeSet::new(),
+            divider: 34,
+            dragging_divider: false,
+            diff_rows: vec![],
+            diff_scroll: 0,
+            diff_signature: None,
+            input: None,
+            show_help: false,
+            message: "watching worktree".into(),
+            remote: RemoteStatus::default(),
+            last_refresh: Instant::now() - Duration::from_secs(1),
+        };
+        app.refresh()?;
+        Ok(app)
+    }
+
+    fn metadata_dir(&self) -> PathBuf {
+        self.repo.join(".luminatti")
+    }
+    fn filters_path(&self) -> PathBuf {
+        self.metadata_dir().join("filters.json")
+    }
+    fn local_comments_path(&self) -> PathBuf {
+        self.metadata_dir().join("comments.json")
+    }
+    fn agent_comments_path(&self) -> PathBuf {
+        self.metadata_dir().join("agent-comments.json")
+    }
+    fn active_path(&self) -> Option<&str> {
+        self.active_file_index()
+            .and_then(|index| self.files.get(index))
+            .map(|file| file.path.as_str())
+    }
+    fn all_comments(&self) -> Vec<&ReviewComment> {
+        self.local_comments
+            .comments
+            .iter()
+            .chain(&self.agent_comments)
+            .collect()
+    }
+
+    fn file_tree_rows(&self) -> Vec<TreeRow> {
+        let mut root = TreeNode::default();
+        for (file_index, file) in self.files.iter().enumerate() {
+            let mut node = &mut root;
+            for segment in file.path.split('/') {
+                node = node.children.entry(segment.to_owned()).or_default();
+            }
+            node.file_index = Some(file_index);
+        }
+        let mut rows = vec![];
+        flatten_tree(&root, "", 0, &self.collapsed_dirs, &mut rows);
+        rows
+    }
+
+    fn active_file_index(&self) -> Option<usize> {
+        self.file_tree_rows()
+            .get(self.selected_file)
+            .and_then(|row| row.file_index)
+    }
+
+    fn select_file(&mut self, file_index: usize) -> Result<()> {
+        let Some(path) = self.files.get(file_index).map(|file| file.path.clone()) else {
+            return Ok(());
+        };
+        self.collapsed_dirs.retain(|directory| {
+            !path
+                .strip_prefix(directory)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        });
+        if let Some(row_index) = self
+            .file_tree_rows()
+            .iter()
+            .position(|row| row.file_index == Some(file_index))
+        {
+            self.selected_file = row_index;
+            self.right_tab = RightTab::Diff;
+            self.focus = Focus::Right;
+            self.rebuild_diff()?;
+        }
+        Ok(())
+    }
+
+    fn toggle_selected_directory(&mut self) {
+        let Some(row) = self.file_tree_rows().get(self.selected_file).cloned() else {
+            return;
+        };
+        if row.file_index.is_some() {
+            return;
+        }
+        if !self.collapsed_dirs.insert(row.path.clone()) {
+            self.collapsed_dirs.remove(&row.path);
+        }
+        self.selected_file = self
+            .selected_file
+            .min(self.file_tree_rows().len().saturating_sub(1));
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        self.filters = read_json(&self.filters_path()).unwrap_or_default();
+        self.local_comments = read_json(&self.local_comments_path()).unwrap_or_default();
+        self.agent_comments =
+            match read_json::<AgentCommentFile>(&self.agent_comments_path()).unwrap_or_default() {
+                AgentCommentFile::Store { comments } => comments,
+                AgentCommentFile::List(comments) => comments,
+                AgentCommentFile::Empty => vec![],
+            };
+        let filter = compile_filters(&self.filters.patterns)?;
+        let (ignored_files, files) = partition_filtered_files(changed_files(&self.repo)?, &filter);
+        self.files = files;
+        self.ignored_files = ignored_files;
+        self.selected_file = self
+            .selected_file
+            .min(self.file_tree_rows().len().saturating_sub(1));
+        self.selected_filter = self
+            .selected_filter
+            .min(self.filters.patterns.len().saturating_sub(1));
+        self.selected_ignored = self
+            .selected_ignored
+            .min(self.ignored_files.len().saturating_sub(1));
+        self.selected_comment = self
+            .selected_comment
+            .min(self.all_comments().len().saturating_sub(1));
+        self.rebuild_diff()?;
+        self.remote = remote_status(&self.repo);
+        self.last_refresh = Instant::now();
+        Ok(())
+    }
+
+    fn rebuild_diff(&mut self) -> Result<()> {
+        let Some(path) = self.active_path().map(str::to_owned) else {
+            self.diff_rows.clear();
+            self.diff_signature = None;
+            return Ok(());
+        };
+        let before = git_show_head_file(&self.repo, &path)?;
+        let after = fs::read_to_string(self.repo.join(&path)).unwrap_or_default();
+        let mut signature_hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut signature_hasher);
+        before.hash(&mut signature_hasher);
+        after.hash(&mut signature_hasher);
+        let signature = signature_hasher.finish();
+        if self.diff_signature == Some(signature) {
+            return Ok(());
+        }
+        self.diff_rows.clear();
+        self.diff_scroll = 0;
+        self.diff_rows = line_diff_rows(&before, &after);
+        self.selected_row = self
+            .diff_rows
+            .iter()
+            .position(DiffRow::is_changed)
+            .unwrap_or(0);
+        self.diff_signature = Some(signature);
+        Ok(())
+    }
+
+    fn save_filters(&self) -> Result<()> {
+        save_json(&self.filters_path(), &self.filters)
+    }
+    fn save_comments(&self) -> Result<()> {
+        save_json(&self.local_comments_path(), &self.local_comments)
+    }
+
+    fn add_comment(&mut self, summary: String) -> Result<()> {
+        let Some(path) = self.active_path().map(str::to_owned) else {
+            bail!("choose a changed file first");
+        };
+        let row = self.diff_rows.get(self.selected_row);
+        let (old_line, new_line) = row
+            .map(|r| (r.old_line, r.new_line))
+            .unwrap_or((None, None));
+        if old_line.is_none() && new_line.is_none() {
+            bail!("choose a diff line first");
+        }
+        self.local_comments.comments.push(ReviewComment {
+            id: new_id(),
+            file_path: path,
+            old_line,
+            new_line,
+            hunk: None,
+            summary,
+            rationale: None,
+            author: None,
+            source: "user".into(),
+        });
+        self.save_comments()?;
+        self.message = "comment saved in .luminatti/comments.json".into();
+        Ok(())
+    }
+
+    fn add_filter(&mut self, glob: String) -> Result<()> {
+        Glob::new(&glob).with_context(|| format!("invalid glob: {glob}"))?;
+        if !self.filters.patterns.contains(&glob) {
+            self.filters.patterns.push(glob);
+            self.save_filters()?;
+        }
+        self.refresh()?;
+        self.message = "filter saved".into();
+        Ok(())
+    }
+
+    fn copy_comment(&mut self) -> Result<()> {
+        let comments = self.all_comments();
+        let comment = comments
+            .get(self.selected_comment)
+            .context("choose a comment first")?;
+        let payload = serde_json::to_string_pretty(comment)?;
+        Clipboard::new()?.set_text(payload)?;
+        self.message = "comment JSON copied to clipboard".into();
+        Ok(())
+    }
+}
+
+fn flatten_tree(
+    node: &TreeNode,
+    prefix: &str,
+    depth: usize,
+    collapsed_dirs: &BTreeSet<String>,
+    rows: &mut Vec<TreeRow>,
+) {
+    for (name, child) in &node.children {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let is_directory = !child.children.is_empty();
+        let expanded = is_directory && !collapsed_dirs.contains(&path);
+        rows.push(TreeRow {
+            path: path.clone(),
+            depth,
+            file_index: child.file_index,
+            expanded,
+        });
+        if is_directory && expanded {
+            flatten_tree(child, &path, depth + 1, collapsed_dirs, rows);
+        }
+    }
+}
+
+impl DiffRow {
+    fn is_changed(&self) -> bool {
+        self.old_changed || self.new_changed || self.old_line.is_none() || self.new_line.is_none()
+    }
+}
+
+fn flush_changed_rows(
+    rows: &mut Vec<DiffRow>,
+    deleted: &mut Vec<(u32, String)>,
+    inserted: &mut Vec<(u32, String)>,
+) {
+    let changed_count = deleted.len().max(inserted.len());
+    for index in 0..changed_count {
+        let old = deleted.get(index);
+        let new = inserted.get(index);
+        rows.push(DiffRow {
+            old_line: old.map(|(line, _)| *line),
+            new_line: new.map(|(line, _)| *line),
+            old_text: old.map(|(_, text)| text.clone()).unwrap_or_default(),
+            new_text: new.map(|(_, text)| text.clone()).unwrap_or_default(),
+            old_changed: old.is_some(),
+            new_changed: new.is_some(),
+        });
+    }
+    deleted.clear();
+    inserted.clear();
+}
+
+fn line_diff_rows(before: &str, after: &str) -> Vec<DiffRow> {
+    let diff = TextDiff::from_lines(before, after);
+    let mut old_line = 0u32;
+    let mut new_line = 0u32;
+    let mut rows = vec![];
+    let mut deleted = vec![];
+    let mut inserted = vec![];
+
+    for change in diff.iter_all_changes() {
+        let text = change.value().trim_end_matches('\n').to_string();
+        match change.tag() {
+            ChangeTag::Delete => {
+                old_line += 1;
+                deleted.push((old_line, text));
+            }
+            ChangeTag::Insert => {
+                new_line += 1;
+                inserted.push((new_line, text));
+            }
+            ChangeTag::Equal => {
+                flush_changed_rows(&mut rows, &mut deleted, &mut inserted);
+                old_line += 1;
+                new_line += 1;
+                rows.push(DiffRow {
+                    old_line: Some(old_line),
+                    new_line: Some(new_line),
+                    old_text: text.clone(),
+                    new_text: text,
+                    old_changed: false,
+                    new_changed: false,
+                });
+            }
+        }
+    }
+    flush_changed_rows(&mut rows, &mut deleted, &mut inserted);
+    rows
+}
+
+fn visible_diff_indices(rows: &[DiffRow], show_unchanged: bool) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| (show_unchanged || row.is_changed()).then_some(index))
+        .collect()
+}
+
+fn rendered_diff_indices(rows: &[DiffRow], show_unchanged: bool, mode: DiffMode) -> Vec<usize> {
+    visible_diff_indices(rows, show_unchanged)
+        .into_iter()
+        .flat_map(|index| {
+            let line_count = if mode == DiffMode::Unified {
+                unified_lines(index, &rows[index], usize::MAX).len()
+            } else {
+                1
+            };
+            std::iter::repeat_n(index, line_count)
+        })
+        .collect()
+}
+
+fn max_diff_scroll(content_height: usize, viewport_height: u16) -> u16 {
+    content_height
+        .saturating_sub(viewport_height as usize)
+        .min(u16::MAX as usize) as u16
+}
+
+fn clamped_diff_scroll(scroll: u16, content_height: usize, viewport_height: u16) -> u16 {
+    scroll.min(max_diff_scroll(content_height, viewport_height))
+}
+
+fn diff_viewport_height(terminal_height: u16) -> u16 {
+    terminal_height.saturating_sub(3)
+}
+
+fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
+    let visible = visible_diff_indices(&app.diff_rows, app.show_unchanged);
+    if visible.is_empty() {
+        return;
+    }
+    let current = visible
+        .iter()
+        .position(|index| *index == app.selected_row)
+        .unwrap_or(0);
+    let next = if down {
+        (current + 1).min(visible.len() - 1)
+    } else {
+        current.saturating_sub(1)
+    };
+    app.selected_row = visible[next];
+    let rendered = rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+    let rendered_start = rendered
+        .iter()
+        .position(|index| *index == app.selected_row)
+        .unwrap_or(0);
+    let rendered_end = rendered
+        .iter()
+        .rposition(|index| *index == app.selected_row)
+        .unwrap_or(rendered_start);
+    let mut scroll = clamped_diff_scroll(app.diff_scroll, rendered.len(), viewport_height) as usize;
+    if rendered_start < scroll {
+        scroll = rendered_start;
+    } else if rendered_end >= scroll + viewport_height as usize {
+        scroll = rendered_end
+            .saturating_add(1)
+            .saturating_sub(viewport_height as usize);
+    }
+    app.diff_scroll = clamped_diff_scroll(
+        scroll.min(u16::MAX as usize) as u16,
+        rendered.len(),
+        viewport_height,
+    );
+}
+
+fn toggle_unchanged(app: &mut App) {
+    app.show_unchanged = !app.show_unchanged;
+    if !app.show_unchanged
+        && app
+            .diff_rows
+            .get(app.selected_row)
+            .is_some_and(|row| !row.is_changed())
+    {
+        app.selected_row = app
+            .diff_rows
+            .iter()
+            .position(DiffRow::is_changed)
+            .unwrap_or(0);
+    }
+    app.diff_scroll = 0;
+    app.message = if app.show_unchanged {
+        "showing unchanged code"
+    } else {
+        "hiding unchanged code"
+    }
+    .into();
+}
+
+fn read_json<T: for<'a> Deserialize<'a> + Default>(path: &Path) -> Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    Ok(serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+    )?)
+}
+fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    fs::create_dir_all(path.parent().context("metadata path missing parent")?)?;
+    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))?;
+    Ok(())
+}
+fn compile_filters(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        builder.add(Glob::new(p).with_context(|| format!("invalid saved filter: {p}"))?);
+    }
+    Ok(builder.build()?)
+}
+
+fn partition_filtered_files(
+    files: Vec<FileItem>,
+    filter: &GlobSet,
+) -> (Vec<FileItem>, Vec<FileItem>) {
+    files
+        .into_iter()
+        .partition(|file| filter.is_match(&file.path))
+}
+fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?)
+}
+fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = git(repo, args)?;
+    if !output.status.success() {
+        bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+fn find_repo(dir: &Path) -> Result<PathBuf> {
+    let dir = fs::canonicalize(dir).with_context(|| format!("cannot access {}", dir.display()))?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !output.status.success() {
+        bail!("{} is not inside a Git worktree", dir.display());
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+fn changed_files(repo: &Path) -> Result<Vec<FileItem>> {
+    let output = git(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let records: Vec<_> = output.stdout.split(|b| *b == 0).collect();
+    let mut seen = BTreeSet::new();
+    let mut files = vec![];
+    let mut index = 0;
+    while index < records.len() {
+        let entry = records[index];
+        if entry.len() < 4 {
+            index += 1;
+            continue;
+        }
+        let status = String::from_utf8_lossy(&entry[..2]).to_string();
+        let path = String::from_utf8_lossy(&entry[3..]).to_string();
+        if seen.insert(path.clone()) {
+            files.push(FileItem { path, status });
+        }
+        // A renamed/copied porcelain v1 record has a second NUL-delimited
+        // source path without a status prefix. It is not another file entry.
+        index += if matches!(entry.first(), Some(b'R' | b'C')) {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(files)
+}
+fn git_show_head_file(repo: &Path, path: &str) -> Result<String> {
+    let spec = format!("HEAD:{path}");
+    let output = git(repo, &["show", &spec])?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Ok(String::new())
+    }
+}
+fn remote_status(repo: &Path) -> RemoteStatus {
+    let branch = git_text(repo, &["branch", "--show-current"])
+        .unwrap_or_else(|_| "detached".into())
+        .trim()
+        .to_string();
+    let branch = if branch.is_empty() {
+        "detached".into()
+    } else {
+        branch
+    };
+    match git_text(
+        repo,
+        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+    ) {
+        Ok(counts) => {
+            let parts: Vec<_> = counts.split_whitespace().collect();
+            RemoteStatus {
+                branch,
+                behind: parts.first().and_then(|count| count.parse().ok()),
+                ahead: parts.get(1).and_then(|count| count.parse().ok()),
+            }
+        }
+        Err(_) => RemoteStatus {
+            branch,
+            behind: None,
+            ahead: None,
+        },
+    }
+}
+
+fn changed_style(changed: bool, deletion: bool) -> Style {
+    if changed {
+        Style::default().fg(if deletion {
+            Color::LightRed
+        } else {
+            Color::LightGreen
+        })
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn draw(frame: &mut ratatui::Frame, app: &App) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(1)])
+        .split(area);
+    let width = constrained_divider(app.divider, vertical[0].width);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(width), Constraint::Min(28)])
+        .split(vertical[0]);
+    draw_left(frame, app, panes[0]);
+    draw_right(frame, app, panes[1]);
+    draw_footer(frame, app, vertical[1]);
+    if let Some(input) = &app.input {
+        if input.kind == InputKind::FileSearch {
+            draw_file_search(frame, app, input, area);
+        } else {
+            draw_input(frame, input, area);
+        }
+    }
+    if app.show_help {
+        draw_help(frame, area);
+    }
+}
+
+fn constrained_divider(requested: u16, terminal_width: u16) -> u16 {
+    // Terminal multiplexers can briefly report a 0×0 size during startup or a
+    // resize. Keep layout arithmetic total so the UI never panics there.
+    if terminal_width < 52 {
+        return terminal_width.saturating_div(2).max(1);
+    }
+    requested.clamp(24, terminal_width - 28)
+}
+
+fn draw_left(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let panels = left_panel_areas(area);
+    draw_files(frame, app, panels[0]);
+    draw_filters(frame, app, panels[1]);
+}
+
+fn left_panel_areas(area: Rect) -> [Rect; 2] {
+    let panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(80), Constraint::Percentage(20)])
+        .split(area);
+    [panels[0], panels[1]]
+}
+
+fn draw_files(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let tree_rows = app.file_tree_rows();
+    let items: Vec<_> = tree_rows
+        .iter()
+        .map(|row| {
+            let name = row.path.rsplit('/').next().unwrap_or(&row.path);
+            let indent = "  ".repeat(row.depth);
+            if let Some(file_index) = row.file_index {
+                let file = &app.files[file_index];
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{indent}  ")),
+                    Span::styled(
+                        format!("{} ", file.status.trim()),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(name.to_owned()),
+                ]))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{indent}{} ", if row.expanded { "▼" } else { "▶" }),
+                        accent_style(),
+                    ),
+                    Span::styled(
+                        name.to_owned(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+            }
+        })
+        .collect();
+    let list = List::new(items)
+        .block(single_panel_block(
+            "[1]",
+            "Files",
+            app.focus == Focus::Files,
+        ))
+        .highlight_style(selected_row_style());
+    let mut state = ratatui::widgets::ListState::default();
+    state.select((!tree_rows.is_empty()).then_some(app.selected_file));
+    frame.render_stateful_widget(list, area, &mut state);
+    render_vertical_scrollbar(
+        frame,
+        area,
+        tree_rows.len(),
+        area.height.saturating_sub(2) as usize,
+        state.offset(),
+    );
+}
+
+fn draw_filters(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let (items, selected) = match app.filter_tab {
+        FilterTab::Filters => (
+            app.filters
+                .patterns
+                .iter()
+                .map(|pattern| ListItem::new(format!("  {pattern}")))
+                .collect::<Vec<_>>(),
+            (!app.filters.patterns.is_empty()).then_some(app.selected_filter),
+        ),
+        FilterTab::Ignored => (
+            app.ignored_files
+                .iter()
+                .map(|file| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{} ", file.status.trim()),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::raw(file.path.clone()),
+                    ]))
+                })
+                .collect::<Vec<_>>(),
+            (!app.ignored_files.is_empty()).then_some(app.selected_ignored),
+        ),
+    };
+    let list = List::new(items)
+        .block(panel_block(
+            "[3]",
+            "Filters",
+            app.filter_tab == FilterTab::Filters,
+            "Ignored",
+            app.filter_tab == FilterTab::Ignored,
+            app.focus == Focus::Filters,
+        ))
+        .highlight_style(selected_row_style())
+        .highlight_symbol("›");
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(selected);
+    frame.render_stateful_widget(list, area, &mut state);
+    render_vertical_scrollbar(
+        frame,
+        area,
+        match app.filter_tab {
+            FilterTab::Filters => app.filters.patterns.len(),
+            FilterTab::Ignored => app.ignored_files.len(),
+        },
+        area.height.saturating_sub(2) as usize,
+        state.offset(),
+    );
+}
+
+fn draw_right(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    match app.right_tab {
+        RightTab::Diff => draw_diff(frame, app, area),
+        RightTab::Comments => draw_comments(frame, app, area),
+    }
+}
+
+fn accent_style() -> Style {
+    Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn selected_row_style() -> Style {
+    accent_style().bg(Color::DarkGray)
+}
+
+fn rounded_block<'a>() -> Block<'a> {
+    Block::default().border_type(BorderType::Rounded)
+}
+
+fn scrollbar_position(content_length: usize, viewport_length: usize, offset: usize) -> usize {
+    let max_offset = content_length.saturating_sub(viewport_length);
+    if max_offset == 0 {
+        return 0;
+    }
+    offset
+        .min(max_offset)
+        .saturating_mul(content_length.saturating_sub(1))
+        / max_offset
+}
+
+fn render_vertical_scrollbar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    content_length: usize,
+    viewport_length: usize,
+    offset: usize,
+) {
+    if content_length <= viewport_length
+        || viewport_length == 0
+        || area.width == 0
+        || area.height <= 2
+    {
+        return;
+    }
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .track_style(Style::default().fg(Color::DarkGray))
+        .thumb_symbol("┃")
+        .thumb_style(Style::default().fg(Color::Gray));
+    let mut state = ScrollbarState::new(content_length)
+        .position(scrollbar_position(content_length, viewport_length, offset))
+        .viewport_content_length(viewport_length);
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
+}
+
+fn single_panel_block(panel: &'static str, title: &'static str, focused: bool) -> Block<'static> {
+    let muted = Style::default().fg(Color::DarkGray);
+    rounded_block()
+        .borders(Borders::ALL)
+        .border_style(if focused { accent_style() } else { muted })
+        .title(Line::from(vec![
+            Span::styled(
+                format!(" {panel} "),
+                if focused { accent_style() } else { muted },
+            ),
+            Span::styled(format!("{title} "), accent_style()),
+        ]))
+}
+
+fn panel_block(
+    panel: &'static str,
+    first: &'static str,
+    first_active: bool,
+    second: &'static str,
+    second_active: bool,
+    focused: bool,
+) -> Block<'static> {
+    let panel_style = if focused {
+        accent_style()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let muted_style = Style::default().fg(Color::DarkGray);
+    rounded_block()
+        .borders(Borders::ALL)
+        .border_style(if focused { accent_style() } else { muted_style })
+        .title(Line::from(vec![
+            Span::styled(format!(" {panel} "), panel_style),
+            Span::styled(
+                first,
+                if first_active {
+                    accent_style()
+                } else {
+                    muted_style
+                },
+            ),
+            Span::styled(" - ", muted_style),
+            Span::styled(
+                format!("{second} "),
+                if second_active {
+                    accent_style()
+                } else {
+                    muted_style
+                },
+            ),
+        ]))
+}
+
+fn right_panel_block(app: &App, changes_active: bool, comments_active: bool) -> Block<'static> {
+    let path = app.active_path().unwrap_or("No changed file");
+    panel_block(
+        "[2]",
+        "Changes",
+        changes_active,
+        "Comments",
+        comments_active,
+        app.focus == Focus::Right,
+    )
+    .title(path_title(path).alignment(Alignment::Right))
+}
+
+fn path_title(path: &str) -> Line<'static> {
+    let (directory, filename) = path
+        .rsplit_once('/')
+        .map_or((String::new(), path.to_owned()), |(directory, filename)| {
+            (format!("{directory}/"), filename.to_owned())
+        });
+
+    Line::from(vec![
+        Span::styled(
+            format!(" {directory}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(format!("{filename} "), Style::default().fg(Color::Gray)),
+    ])
+}
+
+fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let outer = right_panel_block(app, true, false);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let diff_area = inner;
+    let visible = visible_diff_indices(&app.diff_rows, app.show_unchanged);
+    if visible.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No changed lines to display.")
+                .style(Style::default().fg(Color::DarkGray)),
+            diff_area,
+        );
+        return;
+    }
+    let (content_length, scroll) = if app.diff_mode == DiffMode::Unified {
+        let lines: Vec<_> = visible
+            .iter()
+            .flat_map(|index| unified_lines(*index, &app.diff_rows[*index], app.selected_row))
+            .collect();
+        let scroll = clamped_diff_scroll(app.diff_scroll, lines.len(), diff_area.height);
+        let content_length = lines.len();
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), diff_area);
+        (content_length, scroll as usize)
+    } else {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(diff_area);
+        let old: Vec<_> = visible
+            .iter()
+            .map(|index| {
+                let row = &app.diff_rows[*index];
+                side_line(
+                    *index,
+                    row.old_line,
+                    &row.old_text,
+                    row.old_changed,
+                    true,
+                    app.selected_row,
+                )
+            })
+            .collect();
+        let new: Vec<_> = visible
+            .iter()
+            .map(|index| {
+                let row = &app.diff_rows[*index];
+                side_line(
+                    *index,
+                    row.new_line,
+                    &row.new_text,
+                    row.new_changed,
+                    false,
+                    app.selected_row,
+                )
+            })
+            .collect();
+        let scroll = clamped_diff_scroll(app.diff_scroll, visible.len(), diff_area.height);
+        frame.render_widget(Paragraph::new(old).scroll((scroll, 0)), columns[0]);
+        frame.render_widget(
+            Paragraph::new(new).scroll((scroll, 0)).block(
+                rounded_block()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+            columns[1],
+        );
+        (visible.len(), scroll as usize)
+    };
+    render_vertical_scrollbar(
+        frame,
+        area,
+        content_length,
+        diff_area.height as usize,
+        scroll,
+    );
+}
+fn side_line(
+    index: usize,
+    line: Option<u32>,
+    text: &str,
+    changed: bool,
+    deletion: bool,
+    selected: usize,
+) -> Line<'static> {
+    let prefix = line
+        .map(|n| format!("{:>5} ", n))
+        .unwrap_or_else(|| "      ".into());
+    let mut style = changed_style(changed, deletion);
+    if index == selected && line.is_some() {
+        style = style.bg(Color::DarkGray);
+    }
+    Line::from(vec![
+        Span::styled(prefix, style.add_modifier(Modifier::DIM)),
+        Span::styled(text.to_owned(), style),
+    ])
+}
+fn unified_lines(index: usize, row: &DiffRow, selected: usize) -> Vec<Line<'static>> {
+    let mut result = vec![];
+    if row.old_line.is_some() && (row.old_changed || row.new_line.is_none()) {
+        result.push(unified_line(
+            index,
+            row.old_line,
+            &row.old_text,
+            '-',
+            true,
+            selected,
+        ));
+    }
+    if row.new_line.is_some() {
+        result.push(unified_line(
+            index,
+            row.new_line,
+            &row.new_text,
+            if row.new_changed { '+' } else { ' ' },
+            false,
+            selected,
+        ));
+    }
+    result
+}
+fn unified_line(
+    index: usize,
+    line: Option<u32>,
+    text: &str,
+    marker: char,
+    deletion: bool,
+    selected: usize,
+) -> Line<'static> {
+    let mut style = changed_style(marker != ' ', deletion);
+    if index == selected {
+        style = style.bg(Color::DarkGray);
+    }
+    Line::from(vec![
+        Span::styled(
+            format!("{}{:>5} ", marker, line.unwrap_or(0)),
+            style.add_modifier(Modifier::DIM),
+        ),
+        Span::styled(text.to_owned(), style),
+    ])
+}
+
+fn draw_comments(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let comments = app.all_comments();
+    let items: Vec<_> = comments
+        .iter()
+        .map(|c| {
+            let anchor = c
+                .new_line
+                .map(|l| format!("new:{l}"))
+                .or_else(|| c.old_line.map(|l| format!("old:{l}")))
+                .unwrap_or_else(|| "hunk".into());
+            ListItem::new(vec![
+                Line::from(Span::styled(
+                    format!("{}  {}", c.file_path, anchor),
+                    accent_style(),
+                )),
+                Line::from(c.summary.clone()),
+                Line::from(Span::styled(
+                    format!(
+                        "{} · {}",
+                        c.source,
+                        c.author.clone().unwrap_or_else(|| "anonymous".into())
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        })
+        .collect();
+    let list = List::new(items)
+        .block(right_panel_block(app, false, true))
+        .highlight_style(selected_row_style());
+    let mut state = ratatui::widgets::ListState::default();
+    state.select((!comments.is_empty()).then_some(app.selected_comment));
+    frame.render_stateful_widget(list, area, &mut state);
+    render_vertical_scrollbar(
+        frame,
+        area,
+        comments.len(),
+        area.height.saturating_sub(2).saturating_div(3).max(1) as usize,
+        state.offset(),
+    );
+}
+
+fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let status = remote_status_line(app);
+    let status_width = (status.width() as u16)
+        .saturating_add(1)
+        .min(area.width.saturating_sub(3));
+    let pieces = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(status_width)])
+        .split(area);
+    let shortcuts = shortcut_line(app);
+    let mut shortcuts_with_message = shortcuts.clone();
+    shortcuts_with_message.spans.push(Span::styled(
+        format!("  ·  {}", app.message),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let shortcuts = if shortcuts_with_message.width() <= pieces[0].width as usize {
+        shortcuts_with_message
+    } else if shortcuts.width() <= pieces[0].width as usize {
+        shortcuts
+    } else {
+        Line::from(Span::styled(
+            " ? ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(shortcuts), pieces[0]);
+    frame.render_widget(
+        Paragraph::new(status).alignment(Alignment::Right),
+        pieces[1],
+    );
+}
+
+fn push_shortcut(spans: &mut Vec<Span<'static>>, key: &'static str, label: impl Into<String>) {
+    if !spans.is_empty() {
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        format!("[{key}]"),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!(" {}", label.into()),
+        Style::default().fg(Color::Gray),
+    ));
+}
+
+fn shortcut_line(app: &App) -> Line<'static> {
+    let mut spans = vec![];
+    match (app.focus, app.right_tab, app.filter_tab) {
+        (Focus::Files, _, _) => {
+            push_shortcut(&mut spans, "↑/↓", "move");
+            push_shortcut(&mut spans, "Enter", "open/fold");
+            push_shortcut(&mut spans, "Tab", "panel");
+        }
+        (Focus::Filters, _, FilterTab::Filters) => {
+            push_shortcut(&mut spans, "a", "add");
+            push_shortcut(&mut spans, "x", "remove");
+            push_shortcut(&mut spans, "o", "ignored");
+        }
+        (Focus::Filters, _, FilterTab::Ignored) => {
+            push_shortcut(&mut spans, "↑/↓", "move");
+            push_shortcut(&mut spans, "g", "filters");
+        }
+        (Focus::Right, RightTab::Diff, _) => {
+            push_shortcut(&mut spans, "↑/↓", "line");
+            push_shortcut(&mut spans, "c", "comment");
+            if app.diff_mode == DiffMode::SideBySide {
+                push_shortcut(&mut spans, "u", "unified");
+            } else {
+                push_shortcut(&mut spans, "s", "split");
+            }
+            push_shortcut(
+                &mut spans,
+                "i",
+                if app.show_unchanged {
+                    "hide common"
+                } else {
+                    "show common"
+                },
+            );
+        }
+        (Focus::Right, RightTab::Comments, _) => {
+            push_shortcut(&mut spans, "↑/↓", "move");
+            push_shortcut(&mut spans, "y", "copy JSON");
+            push_shortcut(&mut spans, "d", "changes");
+        }
+    }
+    push_shortcut(&mut spans, "/", "find file");
+    push_shortcut(&mut spans, "?", "help");
+    Line::from(spans)
+}
+
+fn remote_status_line(app: &App) -> Line<'static> {
+    let project = app
+        .repo
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("git");
+    let white = Style::default().fg(Color::White);
+    let yellow = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![
+        Span::styled(project.to_owned(), white.add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(app.remote.branch.clone(), white),
+    ];
+    match (app.remote.behind, app.remote.ahead) {
+        (Some(behind), Some(ahead)) => {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("↓", yellow));
+            spans.push(Span::styled(behind.to_string(), white));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("↑", yellow));
+            spans.push(Span::styled(ahead.to_string(), white));
+        }
+        _ => {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("◆", yellow));
+            spans.push(Span::styled(" no upstream", white));
+        }
+    }
+    Line::from(spans)
+}
+
+fn help_binding(key: &'static str, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key:<12}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(description, Style::default().fg(Color::White)),
+    ])
+}
+
+fn help_heading(title: &'static str) -> Line<'static> {
+    Line::from(Span::styled(title, accent_style()))
+}
+
+fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
+    let width = 72.min(area.width.saturating_sub(2)).max(1);
+    let height = 28.min(area.height.saturating_sub(2)).max(1);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let lines = vec![
+        help_heading("GLOBAL"),
+        help_binding("Tab / 1 / 2 / 3", "cycle or focus a panel"),
+        help_binding("h / l", "focus files / changes"),
+        help_binding("/", "find a changed file"),
+        help_binding("r", "refresh"),
+        help_binding("? / Esc", "close help"),
+        help_binding("q", "quit"),
+        Line::default(),
+        help_heading("[1] FILES"),
+        help_binding("↑ / ↓", "move selection"),
+        help_binding("Enter", "open file or fold directory"),
+        Line::default(),
+        help_heading("[2] CHANGES"),
+        help_binding("↑ / ↓", "move through changed lines"),
+        help_binding("u / s", "unified / split view"),
+        help_binding("i", "show or hide common lines"),
+        help_binding("c", "add review comment"),
+        Line::default(),
+        help_heading("[2] COMMENTS"),
+        help_binding("m / d", "comments / changes tab"),
+        help_binding("y", "copy selected comment JSON"),
+        Line::default(),
+        help_heading("[3] FILTERS / IGNORED"),
+        help_binding("g / o", "filters / ignored tab"),
+        help_binding("a / x", "add / remove filter"),
+        help_binding("↑ / ↓", "move selection"),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            rounded_block()
+                .borders(Borders::ALL)
+                .border_style(accent_style())
+                .title(Line::from(Span::styled(" Keybindings ", accent_style()))),
+        ),
+        popup,
+    );
+}
+fn draw_input(frame: &mut ratatui::Frame, input: &Input, area: Rect) {
+    let popup = centered_popup(area, area.width.saturating_mul(3) / 4, 5);
+    frame.render_widget(Clear, popup);
+    let label = if input.kind == InputKind::Comment {
+        "Comment (Enter saves, Esc cancels)"
+    } else {
+        "Exclude glob (Enter saves, Esc cancels)"
+    };
+    frame.render_widget(
+        Paragraph::new(input.value.as_str()).block(
+            rounded_block()
+                .borders(Borders::ALL)
+                .border_style(accent_style())
+                .title(label),
+        ),
+        popup,
+    );
+}
+
+fn centered_popup(area: Rect, requested_width: u16, requested_height: u16) -> Rect {
+    let width = requested_width.min(area.width.saturating_sub(2)).max(1);
+    let height = requested_height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn draw_file_search(frame: &mut ratatui::Frame, app: &App, input: &Input, area: Rect) {
+    let matches = fuzzy_file_indices(&app.files, &input.value);
+    let height = (matches.len().min(11) as u16).saturating_add(3).max(5);
+    let popup = centered_popup(area, area.width.saturating_mul(3) / 4, height);
+    frame.render_widget(Clear, popup);
+
+    let block = rounded_block()
+        .borders(Borders::ALL)
+        .border_style(accent_style())
+        .title(Line::from(Span::styled(
+            " Find file · Enter opens · Esc cancels ",
+            accent_style(),
+        )));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 {
+        return;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("/ ", accent_style()),
+            Span::raw(input.value.clone()),
+        ])),
+        sections[0],
+    );
+    let items = if matches.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  No matching files",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        matches
+            .iter()
+            .map(|index| ListItem::new(format!("  {}", app.files[*index].path)))
+            .collect::<Vec<_>>()
+    };
+    let mut state = ratatui::widgets::ListState::default();
+    state.select((!matches.is_empty()).then(|| input.selected.min(matches.len() - 1)));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(selected_row_style())
+            .highlight_symbol("›"),
+        sections[1],
+        &mut state,
+    );
+    render_vertical_scrollbar(
+        frame,
+        popup,
+        matches.len(),
+        sections[1].height as usize,
+        state.offset(),
+    );
+}
+
+fn move_selection(current: &mut usize, len: usize, down: bool) {
+    if len == 0 {
+        return;
+    }
+    *current = if down {
+        (*current + 1).min(len - 1)
+    } else {
+        current.saturating_sub(1)
+    };
+}
+
+fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let candidate = candidate.to_lowercase();
+    let mut search_from = 0;
+    let mut previous = None;
+    let mut score = 0;
+    for needle in query.to_lowercase().chars() {
+        let (offset, _) = candidate[search_from..]
+            .char_indices()
+            .find(|(_, character)| *character == needle)?;
+        let index = search_from + offset;
+        score -= index as i64;
+        if previous.is_some_and(|previous| previous + 1 == index) {
+            score += 12;
+        }
+        if index == 0
+            || candidate[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|character| matches!(character, '/' | '_' | '-' | '.'))
+        {
+            score += 8;
+        }
+        previous = Some(index);
+        search_from = index + needle.len_utf8();
+    }
+    if candidate.contains(&query.to_lowercase()) {
+        score += 24;
+    }
+    Some(score)
+}
+
+fn fuzzy_file_indices(files: &[FileItem], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..files.len()).collect();
+    }
+    let mut matches = files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| fuzzy_score(&file.path, query).map(|score| (index, score)))
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| {
+                files[*left_index]
+                    .path
+                    .len()
+                    .cmp(&files[*right_index].path.len())
+            })
+            .then_with(|| files[*left_index].path.cmp(&files[*right_index].path))
+    });
+    matches.into_iter().map(|(index, _)| index).collect()
+}
+
+fn handle_file_search_key(app: &mut App, code: KeyCode) -> Result<()> {
+    match code {
+        KeyCode::Esc => app.input = None,
+        KeyCode::Enter => {
+            let file_index = app.input.as_ref().and_then(|input| {
+                fuzzy_file_indices(&app.files, &input.value)
+                    .get(input.selected)
+                    .copied()
+            });
+            if let Some(file_index) = file_index {
+                app.input = None;
+                app.select_file(file_index)?;
+            }
+        }
+        KeyCode::Down | KeyCode::Up => {
+            let query = app
+                .input
+                .as_ref()
+                .map(|input| input.value.as_str())
+                .unwrap_or_default();
+            let match_count = fuzzy_file_indices(&app.files, query).len();
+            if let Some(input) = &mut app.input {
+                move_selection(&mut input.selected, match_count, code == KeyCode::Down);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(input) = &mut app.input {
+                input.value.pop();
+                input.selected = 0;
+            }
+        }
+        KeyCode::Char(character) => {
+            if let Some(input) = &mut app.input {
+                input.value.push(character);
+                input.selected = 0;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_key(app: &mut App, code: KeyCode, terminal_height: u16) -> Result<bool> {
+    if app.show_help {
+        if matches!(code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')) {
+            app.show_help = false;
+        }
+        return Ok(false);
+    }
+    if app
+        .input
+        .as_ref()
+        .is_some_and(|input| input.kind == InputKind::FileSearch)
+    {
+        handle_file_search_key(app, code)?;
+        return Ok(false);
+    }
+    if let Some(input) = &mut app.input {
+        match code {
+            KeyCode::Esc => app.input = None,
+            KeyCode::Enter => {
+                let input = app.input.take().expect("input exists");
+                if input.value.trim().is_empty() {
+                    return Ok(false);
+                }
+                match input.kind {
+                    InputKind::Comment => app.add_comment(input.value)?,
+                    InputKind::Filter => app.add_filter(input.value)?,
+                    InputKind::FileSearch => unreachable!("file search handled above"),
+                };
+            }
+            KeyCode::Backspace => {
+                input.value.pop();
+            }
+            KeyCode::Char(c) => input.value.push(c),
+            _ => {}
+        }
+        return Ok(false);
+    }
+    match code {
+        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('?') => app.show_help = true,
+        KeyCode::Char('/') => {
+            app.input = Some(Input {
+                kind: InputKind::FileSearch,
+                value: String::new(),
+                selected: 0,
+            })
+        }
+        KeyCode::Tab => {
+            app.focus = match app.focus {
+                Focus::Files => Focus::Filters,
+                Focus::Filters => Focus::Right,
+                Focus::Right => Focus::Files,
+            }
+        }
+        KeyCode::Char('h') => app.focus = Focus::Files,
+        KeyCode::Char('l') => app.focus = Focus::Right,
+        KeyCode::Char('1') => app.focus = Focus::Files,
+        KeyCode::Char('2') => app.focus = Focus::Right,
+        KeyCode::Char('3') => app.focus = Focus::Filters,
+        KeyCode::Char('f') => app.focus = Focus::Files,
+        KeyCode::Char('g') => {
+            app.filter_tab = FilterTab::Filters;
+            app.focus = Focus::Filters;
+        }
+        KeyCode::Char('o') => {
+            app.filter_tab = FilterTab::Ignored;
+            app.focus = Focus::Filters;
+        }
+        KeyCode::Char('d') => {
+            app.right_tab = RightTab::Diff;
+            app.focus = Focus::Right;
+        }
+        KeyCode::Char('m') => {
+            app.right_tab = RightTab::Comments;
+            app.focus = Focus::Right;
+        }
+        KeyCode::Char('u') => {
+            app.diff_mode = DiffMode::Unified;
+            app.diff_scroll = 0;
+        }
+        KeyCode::Char('s') => {
+            app.diff_mode = DiffMode::SideBySide;
+            app.diff_scroll = 0;
+        }
+        KeyCode::Char('i') if app.right_tab == RightTab::Diff => toggle_unchanged(app),
+        KeyCode::Char('r') => {
+            app.refresh()?;
+            app.message = "refreshed".into();
+        }
+        KeyCode::Char('c') if app.right_tab == RightTab::Diff => {
+            app.input = Some(Input {
+                kind: InputKind::Comment,
+                value: String::new(),
+                selected: 0,
+            })
+        }
+        KeyCode::Char('a')
+            if app.focus == Focus::Filters && app.filter_tab == FilterTab::Filters =>
+        {
+            app.input = Some(Input {
+                kind: InputKind::Filter,
+                value: String::new(),
+                selected: 0,
+            })
+        }
+        KeyCode::Char('x')
+            if app.focus == Focus::Filters && app.filter_tab == FilterTab::Filters =>
+        {
+            if app.selected_filter < app.filters.patterns.len() {
+                app.filters.patterns.remove(app.selected_filter);
+                app.save_filters()?;
+                app.refresh()?;
+            }
+        }
+        KeyCode::Char('y') if app.right_tab == RightTab::Comments => app.copy_comment()?,
+        KeyCode::Down => match (app.focus, app.right_tab) {
+            (Focus::Files, _) => {
+                let tree_len = app.file_tree_rows().len();
+                move_selection(&mut app.selected_file, tree_len, true)
+            }
+            (Focus::Filters, _) => {
+                if app.filter_tab == FilterTab::Filters {
+                    move_selection(&mut app.selected_filter, app.filters.patterns.len(), true)
+                } else {
+                    move_selection(&mut app.selected_ignored, app.ignored_files.len(), true)
+                }
+            }
+            (Focus::Right, RightTab::Diff) => {
+                move_diff_selection(app, true, diff_viewport_height(terminal_height));
+            }
+            (Focus::Right, RightTab::Comments) => {
+                let comment_count = app.local_comments.comments.len() + app.agent_comments.len();
+                move_selection(&mut app.selected_comment, comment_count, true)
+            }
+        },
+        KeyCode::Up => match (app.focus, app.right_tab) {
+            (Focus::Files, _) => {
+                let tree_len = app.file_tree_rows().len();
+                move_selection(&mut app.selected_file, tree_len, false)
+            }
+            (Focus::Filters, _) => {
+                if app.filter_tab == FilterTab::Filters {
+                    move_selection(&mut app.selected_filter, app.filters.patterns.len(), false)
+                } else {
+                    move_selection(&mut app.selected_ignored, app.ignored_files.len(), false)
+                }
+            }
+            (Focus::Right, RightTab::Diff) => {
+                move_diff_selection(app, false, diff_viewport_height(terminal_height));
+            }
+            (Focus::Right, RightTab::Comments) => {
+                let comment_count = app.local_comments.comments.len() + app.agent_comments.len();
+                move_selection(&mut app.selected_comment, comment_count, false)
+            }
+        },
+        KeyCode::Enter if app.focus == Focus::Files => {
+            if app.active_file_index().is_some() {
+                app.rebuild_diff()?;
+                app.focus = Focus::Right;
+            } else {
+                app.toggle_selected_directory();
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+fn handle_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+    terminal_width: u16,
+    terminal_height: u16,
+) -> Result<()> {
+    if app.show_help || app.input.is_some() {
+        return Ok(());
+    }
+    let divider = constrained_divider(app.divider, terminal_width);
+    let left_panels = left_panel_areas(Rect::new(0, 0, divider, terminal_height.saturating_sub(1)));
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) if mouse.column.abs_diff(divider) <= 1 => {
+            app.dragging_divider = true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.dragging_divider => {
+            app.divider = constrained_divider(mouse.column, terminal_width)
+        }
+        MouseEventKind::Up(MouseButton::Left) => app.dragging_divider = false,
+        MouseEventKind::Down(MouseButton::Left) => {
+            if mouse.row == 0 {
+                if mouse.column < divider {
+                    app.focus = Focus::Files;
+                } else {
+                    app.focus = Focus::Right;
+                    let panel_column = mouse.column.saturating_sub(divider);
+                    if panel_column < 16 {
+                        app.right_tab = RightTab::Diff;
+                    } else if panel_column < 27 {
+                        app.right_tab = RightTab::Comments;
+                    }
+                }
+            } else if mouse.column < divider {
+                if mouse.row < left_panels[1].y {
+                    app.focus = Focus::Files;
+                    let index =
+                        mouse.row.saturating_sub(left_panels[0].y.saturating_add(1)) as usize;
+                    let tree_rows = app.file_tree_rows();
+                    app.selected_file = index.min(tree_rows.len().saturating_sub(1));
+                    if tree_rows
+                        .get(app.selected_file)
+                        .and_then(|row| row.file_index)
+                        .is_some()
+                    {
+                        app.rebuild_diff()?;
+                    }
+                } else {
+                    app.focus = Focus::Filters;
+                    if mouse.row == left_panels[1].y {
+                        let panel_column = mouse.column.saturating_sub(left_panels[1].x);
+                        if panel_column < 16 {
+                            app.filter_tab = FilterTab::Filters;
+                        } else if panel_column < 27 {
+                            app.filter_tab = FilterTab::Ignored;
+                        }
+                        return Ok(());
+                    }
+                    let index =
+                        mouse.row.saturating_sub(left_panels[1].y.saturating_add(1)) as usize;
+                    if app.filter_tab == FilterTab::Filters {
+                        app.selected_filter =
+                            index.min(app.filters.patterns.len().saturating_sub(1));
+                    } else {
+                        app.selected_ignored = index.min(app.ignored_files.len().saturating_sub(1));
+                    }
+                }
+            } else {
+                app.focus = Focus::Right;
+                if app.right_tab == RightTab::Diff {
+                    let rendered =
+                        rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+                    let scroll = clamped_diff_scroll(
+                        app.diff_scroll,
+                        rendered.len(),
+                        diff_viewport_height(terminal_height),
+                    );
+                    let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
+                    if let Some(index) = rendered.get(position) {
+                        app.selected_row = *index;
+                    }
+                } else {
+                    let index = mouse.row.saturating_sub(1) as usize;
+                    app.selected_comment = index.min(app.all_comments().len().saturating_sub(1));
+                }
+            }
+        }
+        MouseEventKind::ScrollDown
+            if app.right_tab == RightTab::Diff && mouse.column >= divider =>
+        {
+            let rendered = rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+            app.diff_scroll = clamped_diff_scroll(
+                app.diff_scroll.saturating_add(3),
+                rendered.len(),
+                diff_viewport_height(terminal_height),
+            );
+        }
+        MouseEventKind::ScrollUp if app.right_tab == RightTab::Diff && mouse.column >= divider => {
+            app.diff_scroll = app.diff_scroll.saturating_sub(3);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn run_tui(mut app: App) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let result = (|| -> Result<()> {
+        loop {
+            terminal.draw(|frame| draw(frame, &app))?;
+            if event::poll(Duration::from_millis(80))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if handle_key(&mut app, key.code, terminal.size()?.height)? {
+                            break;
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        let size = terminal.size()?;
+                        handle_mouse(&mut app, mouse, size.width, size.height)?
+                    }
+                    Event::Resize(_, _) => {}
+                    _ => {}
+                }
+            }
+            if app.input.is_none()
+                && app.last_refresh.elapsed() >= Duration::from_millis(450)
+                && let Err(error) = app.refresh()
+            {
+                app.message = error.to_string();
+            }
+        }
+        Ok(())
+    })();
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let repo = find_repo(&cli.dir)?;
+    if !io::stdout().is_terminal() {
+        bail!("Luminatti needs an interactive terminal");
+    }
+    run_tui(App::new(repo)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn panel_tabs_render_in_the_top_border_with_purple_accents() {
+        let backend = TestBackend::new(32, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    panel_block("[1]", "Files", true, "Filters", false, true),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let top_border: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(top_border.starts_with("╭ [1] Files - Filters "));
+        assert_eq!(buffer[(0, 0)].fg, Color::Magenta);
+        assert_eq!(buffer[(2, 0)].fg, Color::Magenta);
+        assert_eq!(buffer[(6, 0)].fg, Color::Magenta);
+        assert_eq!(buffer[(14, 0)].fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn path_title_mutes_the_directory_and_softens_the_filename() {
+        let line = path_title("packages/business/src/NetsuiteConnector.ts");
+
+        assert_eq!(line.spans[0].content, " packages/business/src/");
+        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(line.spans[1].content, "NetsuiteConnector.ts ");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
+    }
+
+    #[test]
+    fn filters_take_twenty_percent_of_the_left_column() {
+        let panels = left_panel_areas(Rect::new(0, 0, 40, 100));
+        assert_eq!(panels[0].height, 80);
+        assert_eq!(panels[1].height, 20);
+        assert_eq!(panels[1].y, 80);
+    }
+
+    #[test]
+    fn diff_scroll_stays_zero_until_content_exceeds_the_viewport() {
+        assert_eq!(max_diff_scroll(22, 40), 0);
+        assert_eq!(clamped_diff_scroll(12, 22, 40), 0);
+        assert_eq!(max_diff_scroll(60, 40), 20);
+        assert_eq!(clamped_diff_scroll(30, 60, 40), 20);
+    }
+
+    #[test]
+    fn scrollbar_position_reaches_both_ends_of_overflowing_content() {
+        assert_eq!(scrollbar_position(10, 4, 0), 0);
+        assert_eq!(scrollbar_position(10, 4, 6), 9);
+        assert_eq!(scrollbar_position(4, 4, 0), 0);
+    }
+
+    #[test]
+    fn ignored_tab_contains_files_excluded_by_filter_globs() {
+        let filter = compile_filters(&["generated/**".into()]).unwrap();
+        let files = vec![
+            FileItem {
+                path: "src/main.rs".into(),
+                status: " M".into(),
+            },
+            FileItem {
+                path: "generated/client.rs".into(),
+                status: "??".into(),
+            },
+        ];
+        let (ignored, visible) = partition_filtered_files(files, &filter);
+        assert_eq!(ignored[0].path, "generated/client.rs");
+        assert_eq!(visible[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn fuzzy_file_search_matches_subsequences_and_keeps_default_order() {
+        let files = vec![
+            FileItem {
+                path: "src/main.rs".into(),
+                status: " M".into(),
+            },
+            FileItem {
+                path: "src/file_search.rs".into(),
+                status: " M".into(),
+            },
+            FileItem {
+                path: "README.md".into(),
+                status: " M".into(),
+            },
+        ];
+
+        assert_eq!(fuzzy_file_indices(&files, ""), vec![0, 1, 2]);
+        assert_eq!(fuzzy_file_indices(&files, "fs"), vec![1]);
+        assert!(fuzzy_file_indices(&files, "missing").is_empty());
+    }
+
+    #[test]
+    fn line_diff_aligns_replacements_and_tracks_line_numbers() {
+        let rows = line_diff_rows("a\nb\n", "a\nc\n");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].old_line, Some(2));
+        assert_eq!(rows[1].new_line, Some(2));
+        assert_eq!(rows[1].old_text, "b");
+        assert_eq!(rows[1].new_text, "c");
+        assert!(rows[1].old_changed);
+        assert!(rows[1].new_changed);
+    }
+
+    #[test]
+    fn split_diff_does_not_highlight_a_missing_side() {
+        let missing = side_line(0, None, "", false, true, 0);
+        assert!(
+            missing
+                .spans
+                .iter()
+                .all(|span| span.style.bg != Some(Color::DarkGray))
+        );
+
+        let present = side_line(0, Some(1), "added", true, false, 0);
+        assert!(
+            present
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(Color::DarkGray))
+        );
+    }
+
+    #[test]
+    fn agent_comments_accept_hunk_shape() {
+        let parsed: AgentCommentFile = serde_json::from_str(
+            r#"{"comments":[{"filePath":"a.rs","newLine":9,"summary":"test"}]}"#,
+        )
+        .unwrap();
+        match parsed {
+            AgentCommentFile::Store { comments } => assert_eq!(comments[0].new_line, Some(9)),
+            _ => panic!("wrong shape"),
+        }
+    }
+
+    #[test]
+    fn same_code_filter_can_hide_or_include_unchanged_rows() {
+        let rows = line_diff_rows("same\nold\n", "same\nnew\n");
+        assert_eq!(visible_diff_indices(&rows, false), vec![1]);
+        assert_eq!(visible_diff_indices(&rows, true), vec![0, 1]);
+        assert_eq!(
+            rendered_diff_indices(&rows, false, DiffMode::Unified),
+            vec![1, 1]
+        );
+    }
+
+    #[test]
+    fn changed_tree_hides_collapsed_descendants() {
+        let mut root = TreeNode::default();
+        root.children
+            .entry("src".into())
+            .or_default()
+            .children
+            .entry("main.rs".into())
+            .or_default()
+            .file_index = Some(0);
+
+        let mut expanded = vec![];
+        flatten_tree(&root, "", 0, &BTreeSet::new(), &mut expanded);
+        assert_eq!(expanded.len(), 2);
+        assert!(expanded[0].expanded);
+
+        let mut collapsed = vec![];
+        flatten_tree(
+            &root,
+            "",
+            0,
+            &BTreeSet::from(["src".to_owned()]),
+            &mut collapsed,
+        );
+        assert_eq!(collapsed.len(), 1);
+        assert!(!collapsed[0].expanded);
+    }
+}
