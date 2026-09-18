@@ -74,3 +74,38 @@ does not show its own metadata in the review tree.
 
 Agent comments and local notes are anchored to file paths and old/new lines;
 they never modify code.
+
+## Development
+
+The binary entry point in `src/main.rs` only parses arguments, locates the Git
+worktree, and starts the application. Code is organized by responsibility:
+
+| Location | Responsibility |
+| --- | --- |
+| `src/app/mod.rs` | Application state, initialization, and refresh orchestration |
+| `src/app/terminal.rs` | Terminal session and event loop |
+| `src/app/keyboard.rs`, `mouse.rs` | Input dispatch and mouse hit testing |
+| `src/app/navigation.rs`, `layout.rs` | Selection, scrolling, and shared pane geometry |
+| `src/app/diff.rs`, `files.rs`, `review.rs` | Application actions for diffs, file selection, and review metadata |
+| `src/app/ui/` | Read-only rendering for panels, diffs, footer, dialogs, and shared widgets |
+| `src/git.rs` | Git subprocesses, worktree discovery, and branch status |
+| `src/comments.rs`, `filters.rs`, `settings.rs`, `storage.rs` | Metadata schemas and JSON persistence |
+| `src/file_tree.rs`, `search.rs` | File-tree construction and fuzzy matching |
+| `src/diff.rs`, `diff_view.rs` | Diff generation, row alignment, and styled diff lines |
+
+Application internals stay private to `app`; its only entry point is `app::run`.
+Rendering takes an immutable application reference. Git, persistence, and file
+algorithms do not depend on application state. Keep new behavior in the module
+that owns it, and put tests beside that code. Cross-module UI tests use Ratatui's
+in-memory backend and the fixtures in `src/app/test_support.rs`.
+
+Run the application checks with:
+
+```sh
+cargo fmt --check
+cargo test --bin luminatti --locked
+cargo clippy --bin luminatti --all-targets --no-deps --locked -- -D warnings
+```
+
+`vendor/difftastic` is the embedded upstream diff engine and is maintained
+separately from the application's modules.
