@@ -1178,7 +1178,7 @@ fn draw_files(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         .block(single_panel_block(
             "[1]",
             "Files",
-            app.focus == Focus::Files,
+            !app.show_help && app.focus == Focus::Files,
         ))
         .highlight_style(selected_row_style());
     let mut state = ratatui::widgets::ListState::default();
@@ -1226,7 +1226,7 @@ fn draw_filters(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             app.filter_tab == FilterTab::Filters,
             "Ignored",
             app.filter_tab == FilterTab::Ignored,
-            app.focus == Focus::Filters,
+            !app.show_help && app.focus == Focus::Filters,
         ))
         .highlight_style(selected_row_style())
         .highlight_symbol("›");
@@ -1395,7 +1395,7 @@ fn right_panel_block(app: &App, changes_active: bool, comments_active: bool) -> 
         changes_active,
         "Comments",
         comments_active,
-        app.focus == Focus::Right,
+        !app.show_help && app.focus == Focus::Right,
     );
     if app.final_view && changes_active {
         block = block.title_bottom(Line::from(Span::styled(
@@ -1649,35 +1649,32 @@ fn draw_comments(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let area = area.inner(Margin {
+        vertical: 0,
+        horizontal: 1,
+    });
     let status = remote_status_line(app);
-    let status_width = (status.width() as u16)
-        .saturating_add(1)
-        .min(area.width.saturating_sub(3));
+    let shortcuts = permanent_shortcut_line();
+    let shortcuts_width = (shortcuts.width() as u16).min(area.width.saturating_sub(1));
     let pieces = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(status_width)])
+        .constraints([Constraint::Min(1), Constraint::Length(shortcuts_width)])
         .split(area);
-    let shortcuts = shortcut_line(app);
-    let mut shortcuts_with_message = shortcuts.clone();
-    shortcuts_with_message.spans.push(Span::styled(
-        format!("  ·  {}", app.message),
-        Style::default().fg(Color::DarkGray),
-    ));
-    let shortcuts = if shortcuts_with_message.width() <= pieces[0].width as usize {
-        shortcuts_with_message
-    } else if shortcuts.width() <= pieces[0].width as usize {
-        shortcuts
+    let mut status_with_message = status.clone();
+    if !app.message.is_empty() {
+        status_with_message.spans.push(Span::styled(
+            format!("  ·  {}", app.message),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let status = if status_with_message.width() <= pieces[0].width as usize {
+        status_with_message
     } else {
-        Line::from(Span::styled(
-            " ? ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))
+        status
     };
-    frame.render_widget(Paragraph::new(shortcuts), pieces[0]);
+    frame.render_widget(Paragraph::new(status), pieces[0]);
     frame.render_widget(
-        Paragraph::new(status).alignment(Alignment::Right),
+        Paragraph::new(shortcuts).alignment(Alignment::Right),
         pieces[1],
     );
 }
@@ -1706,66 +1703,11 @@ fn push_shortcut(spans: &mut Vec<Span<'static>>, key: &'static str, label: impl 
     push_shortcut_display(spans, format!("[{key}]"), label);
 }
 
-fn shortcut_line(app: &App) -> Line<'static> {
+fn permanent_shortcut_line() -> Line<'static> {
     let mut spans = vec![];
-    match (app.focus, app.right_tab, app.filter_tab) {
-        (Focus::Files, _, _) => {
-            push_shortcut(&mut spans, "↑/↓", "move");
-            push_shortcut(&mut spans, "Enter", "open/fold");
-        }
-        (Focus::Filters, _, FilterTab::Filters) => {
-            push_shortcut(&mut spans, "Tab", "next tab");
-            push_shortcut(&mut spans, "a", "add");
-            push_shortcut(&mut spans, "x", "remove");
-        }
-        (Focus::Filters, _, FilterTab::Ignored) => {
-            push_shortcut(&mut spans, "Tab", "next tab");
-            push_shortcut(&mut spans, "↑/↓", "move");
-        }
-        (Focus::Right, RightTab::Diff, _) => {
-            push_shortcut(&mut spans, "Tab", "next tab");
-            push_shortcut(&mut spans, "↑/↓", "line");
-            push_shortcut(&mut spans, "←/→", "scroll");
-            push_shortcut_display(&mut spans, "[ / ]", "change");
-            push_shortcut_display(&mut spans, "{ / }", "file");
-            push_shortcut(&mut spans, "c", "comment");
-            if app.diff_mode == DiffMode::SideBySide {
-                push_shortcut(&mut spans, "u", "unified");
-            } else {
-                push_shortcut(&mut spans, "s", "split");
-                push_shortcut(
-                    &mut spans,
-                    "h",
-                    if app.final_view {
-                        "show diff"
-                    } else {
-                        "show final"
-                    },
-                );
-            }
-            if !app.final_view {
-                push_shortcut(
-                    &mut spans,
-                    "i",
-                    if app.show_unchanged {
-                        "hide common"
-                    } else {
-                        "show common"
-                    },
-                );
-            }
-        }
-        (Focus::Right, RightTab::Comments, _) => {
-            push_shortcut(&mut spans, "Tab", "next tab");
-            push_shortcut(&mut spans, "↑/↓", "move");
-            push_shortcut(&mut spans, "y", "copy JSON");
-            push_shortcut(&mut spans, "d", "delete");
-            push_shortcut(&mut spans, "D", "delete all");
-        }
-    }
-    push_shortcut(&mut spans, "</>", "width");
-    push_shortcut(&mut spans, "/", "find file");
-    push_shortcut(&mut spans, "?", "help");
+    push_shortcut(&mut spans, "/", "Search");
+    push_shortcut(&mut spans, "?", "Help");
+    push_shortcut(&mut spans, "q", "Quit");
     Line::from(spans)
 }
 
@@ -1811,21 +1753,33 @@ fn help_binding(key: &'static str, description: &'static str) -> Line<'static> {
 
 fn help_heading(title: &'static str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("──────── ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" ────────", Style::default().fg(Color::DarkGray)),
+        Span::raw("                  "),
+        Span::styled(title, Style::default().fg(Color::Magenta)),
     ])
-    .alignment(Alignment::Center)
+}
+
+fn modal_actions(actions: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (index, (key, label)) in actions.iter().enumerate() {
+        spans.push(Span::styled(format!("[{key}]"), accent_style()));
+        spans.push(Span::styled(
+            format!(
+                " {label}{}",
+                if index + 1 == actions.len() {
+                    " "
+                } else {
+                    "   "
+                }
+            ),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    Line::from(spans).alignment(Alignment::Right)
 }
 
 fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
-    let width = 76.min(area.width.saturating_sub(2)).max(1);
-    let height = 34.min(area.height.saturating_sub(1)).max(1);
+    let width = 84.min(area.width.saturating_sub(2)).max(1);
+    let height = 38.min(area.height.saturating_sub(1)).max(1);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1836,33 +1790,35 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         help_heading("GLOBAL"),
         help_binding("1 / 2 / 3", "focus panel; repeat to maximize / restore"),
         help_binding("Tab", "cycle tabs within the focused panel"),
-        help_binding("f / l", "focus files / changes"),
-        help_binding("< / >", "narrow / widen focused panel"),
-        help_binding("[ / ]", "previous / next changed row or file"),
-        help_binding("{ / }", "previous / next changed file"),
+        help_binding(">", "increase panel width"),
+        help_binding("<", "reduce panel width"),
+        help_binding("}", "jump to next file"),
+        help_binding("{", "jump to previous file"),
         help_binding("/", "find a changed file"),
         help_binding("r", "refresh"),
-        help_binding("? / Esc", "close help"),
         help_binding("q", "quit"),
         Line::default(),
-        help_heading("[1] FILES"),
+        help_heading("FILES"),
         help_binding("↑ / ↓", "move selection"),
         help_binding("Enter", "open file or fold directory"),
         Line::default(),
-        help_heading("[2] CHANGES"),
+        help_heading("CHANGES"),
         help_binding("↑ / ↓", "move through changed lines"),
         help_binding("← / →", "scroll code horizontally"),
-        help_binding("u / s · h", "unified / split; h toggles final in unified"),
+        help_binding("]", "jump to next hunk"),
+        help_binding("[", "jump to previous hunk"),
+        help_binding("s", "show split view"),
+        help_binding("u", "show unified view"),
+        help_binding("h", "toggle final version in unified view"),
         help_binding("i", "show or hide common lines"),
         help_binding("c", "add review comment"),
         Line::default(),
-        help_heading("[2] COMMENTS"),
-        help_binding("Tab", "cycle changes / comments"),
+        help_heading("COMMENTS"),
         help_binding("y", "copy selected comment JSON"),
-        help_binding("d / D", "delete selected / all local comments"),
+        help_binding("d", "remove comment"),
+        help_binding("D", "remove all comments"),
         Line::default(),
-        help_heading("[3] FILTERS / IGNORED"),
-        help_binding("Tab", "cycle filters / ignored"),
+        help_heading("FILTERS"),
         help_binding("a / x", "add / remove filter"),
         help_binding("↑ / ↓", "move selection"),
     ];
@@ -1871,21 +1827,9 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         Paragraph::new(lines).block(
             rounded_block()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(Line::from(Span::styled(
-                    " Keybindings ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )))
-                .title_bottom(
-                    Line::from(vec![
-                        Span::raw(" "),
-                        Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                        Span::raw(" Close "),
-                    ])
-                    .alignment(Alignment::Center),
-                ),
+                .border_style(accent_style())
+                .title(Line::from(Span::styled(" Keybindings ", accent_style())))
+                .title_bottom(modal_actions(&[("ESC", "Close")])),
         ),
         popup,
     );
@@ -1893,17 +1837,18 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
 fn draw_input(frame: &mut ratatui::Frame, input: &Input, area: Rect) {
     let popup = centered_popup(area, area.width.saturating_mul(3) / 4, 5);
     frame.render_widget(Clear, popup);
-    let label = if input.kind == InputKind::Comment {
-        "Comment (Enter saves, Esc cancels)"
-    } else {
-        "Exclude glob (Enter saves, Esc cancels)"
+    let (title, save_label) = match input.kind {
+        InputKind::Comment => (" Add Comment... ", "Save comment"),
+        InputKind::Filter => (" Exclude Glob... ", "Save filter"),
+        InputKind::FileSearch => unreachable!("file search has its own dialog"),
     };
     frame.render_widget(
         Paragraph::new(input.value.as_str()).block(
             rounded_block()
                 .borders(Borders::ALL)
                 .border_style(accent_style())
-                .title(label),
+                .title(Line::from(Span::styled(title, accent_style())))
+                .title_bottom(modal_actions(&[("ENTER", save_label), ("ESC", "Cancel")])),
         ),
         popup,
     );
@@ -1921,23 +1866,12 @@ fn draw_delete_all_confirmation(frame: &mut ratatui::Frame, area: Rect) {
         .block(
             rounded_block()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
+                .border_style(accent_style())
                 .title(Line::from(Span::styled(
                     " Confirmation Required ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    accent_style(),
                 )))
-                .title_bottom(
-                    Line::from(vec![
-                        Span::raw(" "),
-                        Span::styled("Enter", accent_style()),
-                        Span::raw(" Confirm  ·  "),
-                        Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                        Span::raw(" Cancel "),
-                    ])
-                    .alignment(Alignment::Center),
-                ),
+                .title_bottom(modal_actions(&[("ENTER", "Confirm"), ("ESC", "Close")])),
         ),
         popup,
     );
@@ -1963,10 +1897,8 @@ fn draw_file_search(frame: &mut ratatui::Frame, app: &App, input: &Input, area: 
     let block = rounded_block()
         .borders(Borders::ALL)
         .border_style(accent_style())
-        .title(Line::from(Span::styled(
-            " Find file · Enter opens · Esc cancels ",
-            accent_style(),
-        )));
+        .title(Line::from(Span::styled(" Open File... ", accent_style())))
+        .title_bottom(modal_actions(&[("ENTER", "Open"), ("ESC", "Close")]));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.height == 0 {
@@ -2782,8 +2714,29 @@ mod tests {
     }
 
     #[test]
+    fn footer_keeps_status_left_and_permanent_shortcuts_right() {
+        let mut app = preview_app("before\n", "after\n");
+        app.repo = PathBuf::from("/tmp/luminatti-cli");
+        app.remote.branch = "main".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+
+        terminal
+            .draw(|frame| draw_footer(frame, &app, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let footer = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(footer.starts_with(" luminatti-cli · main"));
+        assert!(footer.ends_with("[/] Search  [?] Help  [q] Quit "));
+        assert!(!footer.contains("find file"));
+        assert_eq!(buffer[(69, 0)].fg, Color::Yellow);
+    }
+
+    #[test]
     fn keybindings_overlay_renders_as_a_grouped_command_palette() {
-        let backend = TestBackend::new(80, 35);
+        let backend = TestBackend::new(100, 45);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
@@ -2800,14 +2753,68 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(contents.contains("Keybindings"));
-        assert!(contents.contains("──────── GLOBAL ────────"));
-        assert!(contents.contains("──────── [1] FILES ────────"));
+        assert!(contents.contains("                  GLOBAL"));
+        assert!(contents.contains("                  FILES"));
+        assert!(contents.contains("                  CHANGES"));
+        assert!(contents.contains("                  COMMENTS"));
+        assert!(contents.contains("                  FILTERS"));
+        assert!(!contents.contains("GLOBAL ─"));
+        assert!(!contents.contains("FILES ─"));
+        assert!(!contents.contains("CHANGES ─"));
+        assert!(!contents.contains("COMMENTS ─"));
+        assert!(!contents.contains("FILTERS ─"));
+        assert!(contents.contains(">  increase panel width"));
+        assert!(contents.contains("<  reduce panel width"));
+        assert!(contents.contains("}  jump to next file"));
+        assert!(contents.contains("{  jump to previous file"));
+        assert!(contents.contains("]  jump to next hunk"));
+        assert!(contents.contains("[  jump to previous hunk"));
+        assert!(!contents.contains("[ / ]"));
+        assert!(contents.contains("s  show split view"));
+        assert!(contents.contains("u  show unified view"));
+        assert!(contents.contains("h  toggle final version in unified view"));
+        assert!(contents.contains("d  remove comment"));
+        assert!(contents.contains("D  remove all comments"));
+        assert!(!contents.contains("f / l"));
+        assert!(!contents.contains("? / Esc"));
+        assert!(!contents.contains("cycle changes / comments"));
+        assert!(!contents.contains("cycle filters / ignored"));
+        assert!(!contents.contains("[1] FILES"));
+        assert!(!contents.contains("[2] CHANGES"));
+        assert!(!contents.contains("[2] COMMENTS"));
+        assert!(!contents.contains("[3] FILTERS / IGNORED"));
 
-        let popup = Rect::new(2, 0, 76, 34);
+        let popup = Rect::new(8, 3, 84, 38);
+        assert_eq!(buffer[(popup.x, popup.y)].fg, Color::Magenta);
+        let description_column = popup.x + 1 + 18;
+        assert_eq!(buffer[(description_column, popup.y + 1)].symbol(), "G");
+        assert_eq!(buffer[(description_column, popup.y + 1)].fg, Color::Magenta);
+        assert_eq!(buffer[(description_column, popup.y + 2)].symbol(), "f");
         let bottom_border = (popup.x..popup.x + popup.width)
             .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
             .collect::<String>();
-        assert!(bottom_border.contains("Esc Close"));
+        assert!(bottom_border.contains("[ESC] Close"));
+        assert!(bottom_border.ends_with(" [ESC] Close ╯"));
+        let esc_column = popup.x + popup.width - 13;
+        assert_eq!(
+            buffer[(esc_column, popup.y + popup.height - 1)].fg,
+            Color::Magenta
+        );
+    }
+
+    #[test]
+    fn keybindings_overlay_removes_focus_from_background_panels() {
+        let mut app = preview_app("before\n", "after\n");
+        app.focus = Focus::Files;
+        app.show_help = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].fg, Color::DarkGray);
+        assert_eq!(buffer[(18, 3)].fg, Color::Magenta);
+        assert_eq!(app.focus, Focus::Files);
     }
 
     #[test]
@@ -2827,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_all_confirmation_shows_confirm_and_cancel_keys() {
+    fn delete_all_confirmation_shows_confirm_and_close_actions() {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2848,10 +2855,57 @@ mod tests {
         assert!(contents.contains("Are you sure you want to delete all comments?"));
 
         let popup = centered_popup(buffer.area, 52, 5);
+        assert_eq!(buffer[(popup.x, popup.y)].fg, Color::Magenta);
+        assert_eq!(buffer[(popup.x + 2, popup.y)].fg, Color::Magenta);
         let bottom_border = (popup.x..popup.x + popup.width)
             .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
             .collect::<String>();
-        assert!(bottom_border.contains("Enter Confirm  ·  Esc Cancel"));
+        assert!(bottom_border.ends_with(" [ENTER] Confirm   [ESC] Close ╯"));
+    }
+
+    #[test]
+    fn text_entry_modals_use_consistent_titles_and_bottom_actions() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let comment = Input {
+            kind: InputKind::Comment,
+            value: "Looks good".into(),
+            selected: 0,
+        };
+
+        terminal
+            .draw(|frame| draw_input(frame, &comment, frame.area()))
+            .unwrap();
+
+        let popup = centered_popup(terminal.backend().buffer().area, 60, 5);
+        let buffer = terminal.backend().buffer();
+        let top_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y)].symbol())
+            .collect::<String>();
+        let bottom_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
+            .collect::<String>();
+        assert!(top_border.contains("Add Comment..."));
+        assert!(bottom_border.ends_with(" [ENTER] Save comment   [ESC] Cancel ╯"));
+        assert_eq!(buffer[(popup.x, popup.y)].fg, Color::Magenta);
+
+        let filter = Input {
+            kind: InputKind::Filter,
+            value: "target/**".into(),
+            selected: 0,
+        };
+        terminal
+            .draw(|frame| draw_input(frame, &filter, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let top_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y)].symbol())
+            .collect::<String>();
+        let bottom_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
+            .collect::<String>();
+        assert!(top_border.contains("Exclude Glob..."));
+        assert!(bottom_border.ends_with(" [ENTER] Save filter   [ESC] Cancel ╯"));
     }
 
     #[test]
@@ -3022,6 +3076,37 @@ mod tests {
         assert_eq!(fuzzy_file_indices(&files, ""), vec![0, 1, 2]);
         assert_eq!(fuzzy_file_indices(&files, "fs"), vec![1]);
         assert!(fuzzy_file_indices(&files, "missing").is_empty());
+    }
+
+    #[test]
+    fn file_search_renders_title_and_actions_on_opposite_borders() {
+        let mut app = preview_app("before\n", "after\n");
+        app.files = vec![FileItem {
+            path: "src/main.rs".into(),
+            status: " M".into(),
+        }];
+        let input = Input {
+            kind: InputKind::FileSearch,
+            value: String::new(),
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        terminal
+            .draw(|frame| draw_file_search(frame, &app, &input, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let popup = Rect::new(12, 7, 75, 5);
+        let top_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y)].symbol())
+            .collect::<String>();
+        let bottom_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
+            .collect::<String>();
+        assert!(top_border.contains("Open File..."));
+        assert!(!top_border.contains("Enter opens"));
+        assert!(bottom_border.ends_with(" [ENTER] Open   [ESC] Close ╯"));
     }
 
     #[test]
