@@ -23,9 +23,17 @@ This installs `luminatti` to `~/.local/bin` by default. Set `BIN_DIR` or
 
 ## Keys
 
-`Tab` cycles panel focus; `h`/`l` focus the left files or right diff pane.
-`1` focuses Files, `2` Changes/Comments, and `3` Filters; `f` Files, `g`
-Filters, `o` Ignored, `d` Changes, `m` Comments, `u` unified, `s` split,
+`Tab` cycles tabs within the focused panel and never changes panel focus;
+`h`/`l` focus the left files or right diff pane. `1`, `2`, and `3` focus their
+numbered panels; pressing the focused panel's number again maximizes it, and a
+third press restores the normal layout. Use `<`/`>` to narrow or widen the focused
+panel. `[`/`]` move to the previous/next changed row, crossing into the adjacent
+changed file at file boundaries; `{`/`}` jump directly to the previous/next
+changed file. `f` focuses Files, `u` selects unified view,
+and `s` selects split view. In the focused Comments tab,
+`d` deletes the selected local comment and `D` deletes all local comments;
+the latter asks for `Enter` confirmation and accepts `Esc` to cancel.
+Agent-provided comments remain read-only.
 `i` shows or hides common lines, `c` adds a comment, `y` copies the selected
 comment, `a` adds a filter, `x` removes one, `r` refreshes, `?` opens the
 grouped keybinding help, and `q` quits. Use the arrow keys to move. `/` opens

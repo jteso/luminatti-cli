@@ -101,6 +101,11 @@ enum InputKind {
     FileSearch,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfirmationKind {
+    DeleteAllComments,
+}
+
 #[derive(Debug)]
 struct Input {
     kind: InputKind,
@@ -198,6 +203,7 @@ struct App {
     right_tab: RightTab,
     filter_tab: FilterTab,
     focus: Focus,
+    maximized_panel: Option<Focus>,
     diff_mode: DiffMode,
     show_unchanged: bool,
     selected_file: usize,
@@ -212,6 +218,7 @@ struct App {
     diff_scroll: u16,
     diff_signature: Option<u64>,
     input: Option<Input>,
+    confirmation: Option<ConfirmationKind>,
     show_help: bool,
     message: String,
     remote: RemoteStatus,
@@ -230,6 +237,7 @@ impl App {
             right_tab: RightTab::Diff,
             filter_tab: FilterTab::Filters,
             focus: Focus::Files,
+            maximized_panel: None,
             diff_mode: DiffMode::SideBySide,
             show_unchanged: false,
             selected_file: 0,
@@ -244,6 +252,7 @@ impl App {
             diff_scroll: 0,
             diff_signature: None,
             input: None,
+            confirmation: None,
             show_help: false,
             message: "watching worktree".into(),
             remote: RemoteStatus::default(),
@@ -269,6 +278,13 @@ impl App {
         self.active_file_index()
             .and_then(|index| self.files.get(index))
             .map(|file| file.path.as_str())
+    }
+
+    fn focus_panel(&mut self, focus: Focus) {
+        if self.focus != focus {
+            self.maximized_panel = None;
+            self.focus = focus;
+        }
     }
     fn all_comments(&self) -> Vec<&ReviewComment> {
         self.local_comments
@@ -314,7 +330,7 @@ impl App {
         {
             self.selected_file = row_index;
             self.right_tab = RightTab::Diff;
-            self.focus = Focus::Right;
+            self.focus_panel(Focus::Right);
             self.rebuild_diff()?;
         }
         Ok(())
@@ -449,6 +465,39 @@ impl App {
         self.message = "comment JSON copied to clipboard".into();
         Ok(())
     }
+
+    fn delete_selected_comment(&mut self) -> Result<()> {
+        if self.all_comments().is_empty() {
+            self.message = "no comments to delete".into();
+            return Ok(());
+        }
+        if remove_local_comment(&mut self.local_comments, self.selected_comment).is_none() {
+            self.message = "agent comments are read-only".into();
+            return Ok(());
+        }
+        self.save_comments()?;
+        self.selected_comment = self
+            .selected_comment
+            .min(self.all_comments().len().saturating_sub(1));
+        self.message = "comment deleted".into();
+        Ok(())
+    }
+
+    fn delete_all_comments(&mut self) -> Result<()> {
+        if self.local_comments.comments.is_empty() {
+            self.message = "no local comments to delete".into();
+            return Ok(());
+        }
+        self.local_comments.comments.clear();
+        self.save_comments()?;
+        self.selected_comment = 0;
+        self.message = "all local comments deleted".into();
+        Ok(())
+    }
+}
+
+fn remove_local_comment(store: &mut CommentStore, selected: usize) -> Option<ReviewComment> {
+    (selected < store.comments.len()).then(|| store.comments.remove(selected))
 }
 
 fn flatten_tree(
@@ -565,6 +614,41 @@ fn rendered_diff_indices(rows: &[DiffRow], show_unchanged: bool, mode: DiffMode)
         .collect()
 }
 
+fn changed_row_indices(rows: &[DiffRow]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.is_changed().then_some(index))
+        .collect()
+}
+
+fn adjacent_changed_row(rows: &[DiffRow], selected: usize, forward: bool) -> Option<usize> {
+    let changed = changed_row_indices(rows);
+    if forward {
+        changed.into_iter().find(|index| *index > selected)
+    } else {
+        changed.into_iter().rfind(|index| *index < selected)
+    }
+}
+
+fn adjacent_file_index(
+    files: &[FileItem],
+    current_file: Option<usize>,
+    forward: bool,
+) -> Option<usize> {
+    let mut indices = (0..files.len()).collect::<Vec<_>>();
+    indices.sort_by(|left, right| files[*left].path.cmp(&files[*right].path));
+    let position =
+        current_file.and_then(|current| indices.iter().position(|index| *index == current));
+    match (position, forward) {
+        (Some(position), true) => indices.get(position + 1).copied(),
+        (Some(position), false) => position
+            .checked_sub(1)
+            .and_then(|previous| indices.get(previous).copied()),
+        (None, true) => indices.first().copied(),
+        (None, false) => indices.last().copied(),
+    }
+}
+
 fn max_diff_scroll(content_height: usize, viewport_height: u16) -> u16 {
     content_height
         .saturating_sub(viewport_height as usize)
@@ -594,6 +678,10 @@ fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
         current.saturating_sub(1)
     };
     app.selected_row = visible[next];
+    scroll_diff_selection_into_view(app, viewport_height);
+}
+
+fn scroll_diff_selection_into_view(app: &mut App, viewport_height: u16) {
     let rendered = rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
     let rendered_start = rendered
         .iter()
@@ -616,6 +704,49 @@ fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
         rendered.len(),
         viewport_height,
     );
+}
+
+fn move_change_selection(app: &mut App, forward: bool, viewport_height: u16) -> Result<()> {
+    app.right_tab = RightTab::Diff;
+    app.focus_panel(Focus::Right);
+
+    if let Some(target) = adjacent_changed_row(&app.diff_rows, app.selected_row, forward) {
+        app.selected_row = target;
+        scroll_diff_selection_into_view(app, viewport_height);
+        return Ok(());
+    }
+
+    let current_file = app.active_file_index();
+    if let Some(file_index) = adjacent_file_index(&app.files, current_file, forward) {
+        app.select_file(file_index)?;
+        if !forward && let Some(last_change) = changed_row_indices(&app.diff_rows).last().copied() {
+            app.selected_row = last_change;
+            scroll_diff_selection_into_view(app, viewport_height);
+        }
+    } else {
+        app.message = if forward {
+            "already at the last changed file"
+        } else {
+            "already at the first changed file"
+        }
+        .into();
+    }
+    Ok(())
+}
+
+fn move_file_selection(app: &mut App, forward: bool) -> Result<()> {
+    let current_file = app.active_file_index();
+    if let Some(file_index) = adjacent_file_index(&app.files, current_file, forward) {
+        app.select_file(file_index)?;
+    } else {
+        app.message = if forward {
+            "already at the last changed file"
+        } else {
+            "already at the first changed file"
+        }
+        .into();
+    }
+    Ok(())
 }
 
 fn toggle_unchanged(app: &mut App) {
@@ -789,13 +920,20 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(1)])
         .split(area);
-    let width = constrained_divider(app.divider, vertical[0].width);
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(width), Constraint::Min(28)])
-        .split(vertical[0]);
-    draw_left(frame, app, panes[0]);
-    draw_right(frame, app, panes[1]);
+    match app.maximized_panel {
+        Some(Focus::Files) => draw_files(frame, app, vertical[0]),
+        Some(Focus::Filters) => draw_filters(frame, app, vertical[0]),
+        Some(Focus::Right) => draw_right(frame, app, vertical[0]),
+        None => {
+            let width = constrained_divider(app.divider, vertical[0].width);
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(width), Constraint::Min(28)])
+                .split(vertical[0]);
+            draw_left(frame, app, panes[0]);
+            draw_right(frame, app, panes[1]);
+        }
+    }
     draw_footer(frame, app, vertical[1]);
     if let Some(input) = &app.input {
         if input.kind == InputKind::FileSearch {
@@ -803,6 +941,9 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         } else {
             draw_input(frame, input, area);
         }
+    }
+    if app.confirmation == Some(ConfirmationKind::DeleteAllComments) {
+        draw_delete_all_confirmation(frame, area);
     }
     if app.show_help {
         draw_help(frame, area);
@@ -816,6 +957,18 @@ fn constrained_divider(requested: u16, terminal_width: u16) -> u16 {
         return terminal_width.saturating_div(2).max(1);
     }
     requested.clamp(24, terminal_width - 28)
+}
+
+fn resize_focused_panel(divider: &mut u16, focus: Focus, wider: bool, terminal_width: u16) {
+    const STEP: u16 = 4;
+    let focused_on_left = focus != Focus::Right;
+    let grow_left = focused_on_left == wider;
+    let requested = if grow_left {
+        divider.saturating_add(STEP)
+    } else {
+        divider.saturating_sub(STEP)
+    };
+    *divider = constrained_divider(requested, terminal_width);
 }
 
 fn draw_left(frame: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -1055,15 +1208,23 @@ fn panel_block(
 
 fn right_panel_block(app: &App, changes_active: bool, comments_active: bool) -> Block<'static> {
     let path = app.active_path().unwrap_or("No changed file");
-    panel_block(
+    let block = panel_block(
         "[2]",
         "Changes",
         changes_active,
         "Comments",
         comments_active,
         app.focus == Focus::Right,
-    )
-    .title(path_title(path).alignment(Alignment::Right))
+    );
+    if let Some(title) = right_panel_path_title(path, comments_active) {
+        block.title(title)
+    } else {
+        block
+    }
+}
+
+fn right_panel_path_title(path: &str, comments_active: bool) -> Option<Line<'static>> {
+    (!comments_active).then(|| path_title(path).alignment(Alignment::Right))
 }
 
 fn path_title(path: &str) -> Line<'static> {
@@ -1299,12 +1460,16 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     );
 }
 
-fn push_shortcut(spans: &mut Vec<Span<'static>>, key: &'static str, label: impl Into<String>) {
+fn push_shortcut_display(
+    spans: &mut Vec<Span<'static>>,
+    display: impl Into<String>,
+    label: impl Into<String>,
+) {
     if !spans.is_empty() {
         spans.push(Span::raw("  "));
     }
     spans.push(Span::styled(
-        format!("[{key}]"),
+        display.into(),
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -1315,25 +1480,31 @@ fn push_shortcut(spans: &mut Vec<Span<'static>>, key: &'static str, label: impl 
     ));
 }
 
+fn push_shortcut(spans: &mut Vec<Span<'static>>, key: &'static str, label: impl Into<String>) {
+    push_shortcut_display(spans, format!("[{key}]"), label);
+}
+
 fn shortcut_line(app: &App) -> Line<'static> {
     let mut spans = vec![];
     match (app.focus, app.right_tab, app.filter_tab) {
         (Focus::Files, _, _) => {
             push_shortcut(&mut spans, "↑/↓", "move");
             push_shortcut(&mut spans, "Enter", "open/fold");
-            push_shortcut(&mut spans, "Tab", "panel");
         }
         (Focus::Filters, _, FilterTab::Filters) => {
+            push_shortcut(&mut spans, "Tab", "next tab");
             push_shortcut(&mut spans, "a", "add");
             push_shortcut(&mut spans, "x", "remove");
-            push_shortcut(&mut spans, "o", "ignored");
         }
         (Focus::Filters, _, FilterTab::Ignored) => {
+            push_shortcut(&mut spans, "Tab", "next tab");
             push_shortcut(&mut spans, "↑/↓", "move");
-            push_shortcut(&mut spans, "g", "filters");
         }
         (Focus::Right, RightTab::Diff, _) => {
+            push_shortcut(&mut spans, "Tab", "next tab");
             push_shortcut(&mut spans, "↑/↓", "line");
+            push_shortcut_display(&mut spans, "[ / ]", "change");
+            push_shortcut_display(&mut spans, "{ / }", "file");
             push_shortcut(&mut spans, "c", "comment");
             if app.diff_mode == DiffMode::SideBySide {
                 push_shortcut(&mut spans, "u", "unified");
@@ -1351,11 +1522,14 @@ fn shortcut_line(app: &App) -> Line<'static> {
             );
         }
         (Focus::Right, RightTab::Comments, _) => {
+            push_shortcut(&mut spans, "Tab", "next tab");
             push_shortcut(&mut spans, "↑/↓", "move");
             push_shortcut(&mut spans, "y", "copy JSON");
-            push_shortcut(&mut spans, "d", "changes");
+            push_shortcut(&mut spans, "d", "delete");
+            push_shortcut(&mut spans, "D", "delete all");
         }
     }
+    push_shortcut(&mut spans, "</>", "width");
     push_shortcut(&mut spans, "/", "find file");
     push_shortcut(&mut spans, "?", "help");
     Line::from(spans)
@@ -1396,23 +1570,28 @@ fn remote_status_line(app: &App) -> Line<'static> {
 
 fn help_binding(key: &'static str, description: &'static str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("  {key:<12}"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(description, Style::default().fg(Color::White)),
+        Span::styled(format!("{key:>16}  "), Style::default().fg(Color::Cyan)),
+        Span::styled(description, Style::default().fg(Color::Gray)),
     ])
 }
 
 fn help_heading(title: &'static str) -> Line<'static> {
-    Line::from(Span::styled(title, accent_style()))
+    Line::from(vec![
+        Span::styled("──────── ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ────────", Style::default().fg(Color::DarkGray)),
+    ])
+    .alignment(Alignment::Center)
 }
 
 fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
-    let width = 72.min(area.width.saturating_sub(2)).max(1);
-    let height = 28.min(area.height.saturating_sub(2)).max(1);
+    let width = 76.min(area.width.saturating_sub(2)).max(1);
+    let height = 33.min(area.height.saturating_sub(2)).max(1);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1421,8 +1600,12 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
     );
     let lines = vec![
         help_heading("GLOBAL"),
-        help_binding("Tab / 1 / 2 / 3", "cycle or focus a panel"),
+        help_binding("1 / 2 / 3", "focus panel; repeat to maximize / restore"),
+        help_binding("Tab", "cycle tabs within the focused panel"),
         help_binding("h / l", "focus files / changes"),
+        help_binding("< / >", "narrow / widen focused panel"),
+        help_binding("[ / ]", "previous / next changed row or file"),
+        help_binding("{ / }", "previous / next changed file"),
         help_binding("/", "find a changed file"),
         help_binding("r", "refresh"),
         help_binding("? / Esc", "close help"),
@@ -1439,11 +1622,12 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         help_binding("c", "add review comment"),
         Line::default(),
         help_heading("[2] COMMENTS"),
-        help_binding("m / d", "comments / changes tab"),
+        help_binding("Tab", "cycle changes / comments"),
         help_binding("y", "copy selected comment JSON"),
+        help_binding("d / D", "delete selected / all local comments"),
         Line::default(),
         help_heading("[3] FILTERS / IGNORED"),
-        help_binding("g / o", "filters / ignored tab"),
+        help_binding("Tab", "cycle filters / ignored"),
         help_binding("a / x", "add / remove filter"),
         help_binding("↑ / ↓", "move selection"),
     ];
@@ -1452,8 +1636,21 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         Paragraph::new(lines).block(
             rounded_block()
                 .borders(Borders::ALL)
-                .border_style(accent_style())
-                .title(Line::from(Span::styled(" Keybindings ", accent_style()))),
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Line::from(Span::styled(
+                    " Keybindings ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .title_bottom(
+                    Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                        Span::raw(" Close "),
+                    ])
+                    .alignment(Alignment::Center),
+                ),
         ),
         popup,
     );
@@ -1472,6 +1669,40 @@ fn draw_input(frame: &mut ratatui::Frame, input: &Input, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(accent_style())
                 .title(label),
+        ),
+        popup,
+    );
+}
+
+fn draw_delete_all_confirmation(frame: &mut ratatui::Frame, area: Rect) {
+    let popup = centered_popup(area, 52, 5);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::default(),
+            Line::from("Are you sure you want to delete all comments?"),
+        ])
+        .alignment(Alignment::Center)
+        .block(
+            rounded_block()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Line::from(Span::styled(
+                    " Confirmation Required ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .title_bottom(
+                    Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("Enter", accent_style()),
+                        Span::raw(" Confirm  ·  "),
+                        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                        Span::raw(" Cancel "),
+                    ])
+                    .alignment(Alignment::Center),
+                ),
         ),
         popup,
     );
@@ -1656,10 +1887,64 @@ fn handle_file_search_key(app: &mut App, code: KeyCode) -> Result<()> {
     Ok(())
 }
 
-fn handle_key(app: &mut App, code: KeyCode, terminal_height: u16) -> Result<bool> {
+fn activate_numbered_panel(panel: u8, focus: &mut Focus, maximized_panel: &mut Option<Focus>) {
+    let target = match panel {
+        1 => Focus::Files,
+        2 => Focus::Right,
+        3 => Focus::Filters,
+        _ => return,
+    };
+    if *focus != target {
+        *focus = target;
+        *maximized_panel = None;
+    } else if *maximized_panel == Some(target) {
+        *maximized_panel = None;
+    } else {
+        *maximized_panel = Some(target);
+    }
+}
+
+fn cycle_focused_panel_tab(focus: Focus, right_tab: &mut RightTab, filter_tab: &mut FilterTab) {
+    match focus {
+        Focus::Right => {
+            *right_tab = match *right_tab {
+                RightTab::Diff => RightTab::Comments,
+                RightTab::Comments => RightTab::Diff,
+            }
+        }
+        Focus::Filters => {
+            *filter_tab = match *filter_tab {
+                FilterTab::Filters => FilterTab::Ignored,
+                FilterTab::Ignored => FilterTab::Filters,
+            }
+        }
+        Focus::Files => {}
+    }
+}
+
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    terminal_width: u16,
+    terminal_height: u16,
+) -> Result<bool> {
     if app.show_help {
         if matches!(code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')) {
             app.show_help = false;
+        }
+        return Ok(false);
+    }
+    if app.confirmation == Some(ConfirmationKind::DeleteAllComments) {
+        match code {
+            KeyCode::Enter => {
+                app.confirmation = None;
+                app.delete_all_comments()?;
+            }
+            KeyCode::Esc => {
+                app.confirmation = None;
+                app.message = "delete cancelled".into();
+            }
+            _ => {}
         }
         return Ok(false);
     }
@@ -1703,34 +1988,32 @@ fn handle_key(app: &mut App, code: KeyCode, terminal_height: u16) -> Result<bool
                 selected: 0,
             })
         }
-        KeyCode::Tab => {
-            app.focus = match app.focus {
-                Focus::Files => Focus::Filters,
-                Focus::Filters => Focus::Right,
-                Focus::Right => Focus::Files,
-            }
+        KeyCode::Tab => cycle_focused_panel_tab(app.focus, &mut app.right_tab, &mut app.filter_tab),
+        KeyCode::Char('h') => app.focus_panel(Focus::Files),
+        KeyCode::Char('l') => app.focus_panel(Focus::Right),
+        KeyCode::Char('<') => {
+            resize_focused_panel(&mut app.divider, app.focus, false, terminal_width)
         }
-        KeyCode::Char('h') => app.focus = Focus::Files,
-        KeyCode::Char('l') => app.focus = Focus::Right,
-        KeyCode::Char('1') => app.focus = Focus::Files,
-        KeyCode::Char('2') => app.focus = Focus::Right,
-        KeyCode::Char('3') => app.focus = Focus::Filters,
-        KeyCode::Char('f') => app.focus = Focus::Files,
-        KeyCode::Char('g') => {
-            app.filter_tab = FilterTab::Filters;
-            app.focus = Focus::Filters;
+        KeyCode::Char('>') => {
+            resize_focused_panel(&mut app.divider, app.focus, true, terminal_width)
         }
-        KeyCode::Char('o') => {
-            app.filter_tab = FilterTab::Ignored;
-            app.focus = Focus::Filters;
+        KeyCode::Char('[') => {
+            move_change_selection(app, false, diff_viewport_height(terminal_height))?
         }
-        KeyCode::Char('d') => {
-            app.right_tab = RightTab::Diff;
-            app.focus = Focus::Right;
+        KeyCode::Char(']') => {
+            move_change_selection(app, true, diff_viewport_height(terminal_height))?
         }
-        KeyCode::Char('m') => {
-            app.right_tab = RightTab::Comments;
-            app.focus = Focus::Right;
+        KeyCode::Char('{') => move_file_selection(app, false)?,
+        KeyCode::Char('}') => move_file_selection(app, true)?,
+        KeyCode::Char('1') => activate_numbered_panel(1, &mut app.focus, &mut app.maximized_panel),
+        KeyCode::Char('2') => activate_numbered_panel(2, &mut app.focus, &mut app.maximized_panel),
+        KeyCode::Char('3') => activate_numbered_panel(3, &mut app.focus, &mut app.maximized_panel),
+        KeyCode::Char('f') => app.focus_panel(Focus::Files),
+        KeyCode::Char('d') if app.focus == Focus::Right && app.right_tab == RightTab::Comments => {
+            app.delete_selected_comment()?;
+        }
+        KeyCode::Char('D') if app.focus == Focus::Right && app.right_tab == RightTab::Comments => {
+            app.confirmation = Some(ConfirmationKind::DeleteAllComments);
         }
         KeyCode::Char('u') => {
             app.diff_mode = DiffMode::Unified;
@@ -1814,7 +2097,7 @@ fn handle_key(app: &mut App, code: KeyCode, terminal_height: u16) -> Result<bool
         KeyCode::Enter if app.focus == Focus::Files => {
             if app.active_file_index().is_some() {
                 app.rebuild_diff()?;
-                app.focus = Focus::Right;
+                app.focus_panel(Focus::Right);
             } else {
                 app.toggle_selected_directory();
             }
@@ -1829,8 +2112,11 @@ fn handle_mouse(
     terminal_width: u16,
     terminal_height: u16,
 ) -> Result<()> {
-    if app.show_help || app.input.is_some() {
+    if app.show_help || app.input.is_some() || app.confirmation.is_some() {
         return Ok(());
+    }
+    if let Some(panel) = app.maximized_panel {
+        return handle_maximized_mouse(app, panel, mouse, terminal_height);
     }
     let divider = constrained_divider(app.divider, terminal_width);
     let left_panels = left_panel_areas(Rect::new(0, 0, divider, terminal_height.saturating_sub(1)));
@@ -1845,9 +2131,9 @@ fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) => {
             if mouse.row == 0 {
                 if mouse.column < divider {
-                    app.focus = Focus::Files;
+                    app.focus_panel(Focus::Files);
                 } else {
-                    app.focus = Focus::Right;
+                    app.focus_panel(Focus::Right);
                     let panel_column = mouse.column.saturating_sub(divider);
                     if panel_column < 16 {
                         app.right_tab = RightTab::Diff;
@@ -1857,7 +2143,7 @@ fn handle_mouse(
                 }
             } else if mouse.column < divider {
                 if mouse.row < left_panels[1].y {
-                    app.focus = Focus::Files;
+                    app.focus_panel(Focus::Files);
                     let index =
                         mouse.row.saturating_sub(left_panels[0].y.saturating_add(1)) as usize;
                     let tree_rows = app.file_tree_rows();
@@ -1870,7 +2156,7 @@ fn handle_mouse(
                         app.rebuild_diff()?;
                     }
                 } else {
-                    app.focus = Focus::Filters;
+                    app.focus_panel(Focus::Filters);
                     if mouse.row == left_panels[1].y {
                         let panel_column = mouse.column.saturating_sub(left_panels[1].x);
                         if panel_column < 16 {
@@ -1890,7 +2176,7 @@ fn handle_mouse(
                     }
                 }
             } else {
-                app.focus = Focus::Right;
+                app.focus_panel(Focus::Right);
                 if app.right_tab == RightTab::Diff {
                     let rendered =
                         rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
@@ -1927,6 +2213,83 @@ fn handle_mouse(
     Ok(())
 }
 
+fn handle_maximized_mouse(
+    app: &mut App,
+    panel: Focus,
+    mouse: crossterm::event::MouseEvent,
+    terminal_height: u16,
+) -> Result<()> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => match panel {
+            Focus::Files if mouse.row > 0 => {
+                let index = mouse.row.saturating_sub(1) as usize;
+                let tree_rows = app.file_tree_rows();
+                app.selected_file = index.min(tree_rows.len().saturating_sub(1));
+                if tree_rows
+                    .get(app.selected_file)
+                    .and_then(|row| row.file_index)
+                    .is_some()
+                {
+                    app.rebuild_diff()?;
+                }
+            }
+            Focus::Filters if mouse.row == 0 => {
+                if mouse.column < 16 {
+                    app.filter_tab = FilterTab::Filters;
+                } else if mouse.column < 27 {
+                    app.filter_tab = FilterTab::Ignored;
+                }
+            }
+            Focus::Filters => {
+                let index = mouse.row.saturating_sub(1) as usize;
+                if app.filter_tab == FilterTab::Filters {
+                    app.selected_filter = index.min(app.filters.patterns.len().saturating_sub(1));
+                } else {
+                    app.selected_ignored = index.min(app.ignored_files.len().saturating_sub(1));
+                }
+            }
+            Focus::Right if mouse.row == 0 => {
+                if mouse.column < 16 {
+                    app.right_tab = RightTab::Diff;
+                } else if mouse.column < 27 {
+                    app.right_tab = RightTab::Comments;
+                }
+            }
+            Focus::Right if app.right_tab == RightTab::Diff => {
+                let rendered =
+                    rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+                let scroll = clamped_diff_scroll(
+                    app.diff_scroll,
+                    rendered.len(),
+                    diff_viewport_height(terminal_height),
+                );
+                let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
+                if let Some(index) = rendered.get(position) {
+                    app.selected_row = *index;
+                }
+            }
+            Focus::Right => {
+                let index = mouse.row.saturating_sub(1) as usize;
+                app.selected_comment = index.min(app.all_comments().len().saturating_sub(1));
+            }
+            Focus::Files => {}
+        },
+        MouseEventKind::ScrollDown if panel == Focus::Right && app.right_tab == RightTab::Diff => {
+            let rendered = rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+            app.diff_scroll = clamped_diff_scroll(
+                app.diff_scroll.saturating_add(3),
+                rendered.len(),
+                diff_viewport_height(terminal_height),
+            );
+        }
+        MouseEventKind::ScrollUp if panel == Focus::Right && app.right_tab == RightTab::Diff => {
+            app.diff_scroll = app.diff_scroll.saturating_sub(3);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn run_tui(mut app: App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1939,7 +2302,8 @@ fn run_tui(mut app: App) -> Result<()> {
             if event::poll(Duration::from_millis(80))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if handle_key(&mut app, key.code, terminal.size()?.height)? {
+                        let size = terminal.size()?;
+                        if handle_key(&mut app, key.code, size.width, size.height)? {
                             break;
                         }
                     }
@@ -2010,6 +2374,35 @@ mod tests {
     }
 
     #[test]
+    fn keybindings_overlay_renders_as_a_grouped_command_palette() {
+        let backend = TestBackend::new(80, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_help(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let contents = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(contents.contains("Keybindings"));
+        assert!(contents.contains("──────── GLOBAL ────────"));
+        assert!(contents.contains("──────── [1] FILES ────────"));
+
+        let popup = Rect::new(2, 1, 76, 33);
+        let bottom_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
+            .collect::<String>();
+        assert!(bottom_border.contains("Esc Close"));
+    }
+
+    #[test]
     fn path_title_mutes_the_directory_and_softens_the_filename() {
         let line = path_title("packages/business/src/NetsuiteConnector.ts");
 
@@ -2020,11 +2413,118 @@ mod tests {
     }
 
     #[test]
+    fn comments_tab_hides_the_file_path_title() {
+        assert!(right_panel_path_title("src/main.rs", true).is_none());
+        assert!(right_panel_path_title("src/main.rs", false).is_some());
+    }
+
+    #[test]
+    fn delete_all_confirmation_shows_confirm_and_cancel_keys() {
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_delete_all_confirmation(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let contents = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(contents.contains("Confirmation Required"));
+        assert!(contents.contains("Are you sure you want to delete all comments?"));
+
+        let popup = centered_popup(buffer.area, 52, 5);
+        let bottom_border = (popup.x..popup.x + popup.width)
+            .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
+            .collect::<String>();
+        assert!(bottom_border.contains("Enter Confirm  ·  Esc Cancel"));
+    }
+
+    #[test]
+    fn repeated_panel_numbers_focus_maximize_and_restore_without_changing_tabs() {
+        let mut focus = Focus::Files;
+        let mut maximized_panel = None;
+        let right_tab = RightTab::Comments;
+        let filter_tab = FilterTab::Ignored;
+
+        activate_numbered_panel(3, &mut focus, &mut maximized_panel);
+        assert_eq!(focus, Focus::Filters);
+        assert_eq!(maximized_panel, None);
+        assert_eq!(filter_tab, FilterTab::Ignored);
+        activate_numbered_panel(3, &mut focus, &mut maximized_panel);
+        assert_eq!(maximized_panel, Some(Focus::Filters));
+        activate_numbered_panel(3, &mut focus, &mut maximized_panel);
+        assert_eq!(maximized_panel, None);
+
+        activate_numbered_panel(2, &mut focus, &mut maximized_panel);
+        assert_eq!(focus, Focus::Right);
+        assert_eq!(right_tab, RightTab::Comments);
+        activate_numbered_panel(2, &mut focus, &mut maximized_panel);
+        assert_eq!(maximized_panel, Some(Focus::Right));
+        activate_numbered_panel(2, &mut focus, &mut maximized_panel);
+        assert_eq!(maximized_panel, None);
+
+        activate_numbered_panel(1, &mut focus, &mut maximized_panel);
+        assert_eq!(focus, Focus::Files);
+        assert_eq!(maximized_panel, None);
+    }
+
+    #[test]
+    fn tab_cycles_only_within_the_focused_panel() {
+        let mut right_tab = RightTab::Diff;
+        let mut filter_tab = FilterTab::Filters;
+
+        cycle_focused_panel_tab(Focus::Right, &mut right_tab, &mut filter_tab);
+        assert_eq!(right_tab, RightTab::Comments);
+        assert_eq!(filter_tab, FilterTab::Filters);
+
+        cycle_focused_panel_tab(Focus::Filters, &mut right_tab, &mut filter_tab);
+        assert_eq!(right_tab, RightTab::Comments);
+        assert_eq!(filter_tab, FilterTab::Ignored);
+
+        cycle_focused_panel_tab(Focus::Files, &mut right_tab, &mut filter_tab);
+        assert_eq!(right_tab, RightTab::Comments);
+        assert_eq!(filter_tab, FilterTab::Ignored);
+    }
+
+    #[test]
     fn filters_take_twenty_percent_of_the_left_column() {
         let panels = left_panel_areas(Rect::new(0, 0, 40, 100));
         assert_eq!(panels[0].height, 80);
         assert_eq!(panels[1].height, 20);
         assert_eq!(panels[1].y, 80);
+    }
+
+    #[test]
+    fn resize_shortcuts_change_the_focused_panel_width() {
+        let mut divider = 34;
+
+        resize_focused_panel(&mut divider, Focus::Files, true, 100);
+        assert_eq!(divider, 38);
+        resize_focused_panel(&mut divider, Focus::Filters, false, 100);
+        assert_eq!(divider, 34);
+
+        resize_focused_panel(&mut divider, Focus::Right, true, 100);
+        assert_eq!(divider, 30);
+        resize_focused_panel(&mut divider, Focus::Right, false, 100);
+        assert_eq!(divider, 34);
+    }
+
+    #[test]
+    fn resize_shortcuts_preserve_minimum_panel_widths() {
+        let mut divider = 24;
+        resize_focused_panel(&mut divider, Focus::Files, false, 100);
+        assert_eq!(divider, 24);
+
+        divider = 72;
+        resize_focused_panel(&mut divider, Focus::Right, false, 100);
+        assert_eq!(divider, 72);
     }
 
     #[test]
@@ -2095,6 +2595,47 @@ mod tests {
     }
 
     #[test]
+    fn bracket_navigation_visits_each_changed_row_including_adjacent_changes() {
+        let rows = line_diff_rows(
+            "same\nold one\nold two\nbetween\nold three\nend\n",
+            "same\nnew one\nnew two\nbetween\nnew three\nend\n",
+        );
+
+        assert_eq!(changed_row_indices(&rows), vec![1, 2, 4]);
+        assert_eq!(adjacent_changed_row(&rows, 1, true), Some(2));
+        assert_eq!(adjacent_changed_row(&rows, 2, true), Some(4));
+        assert_eq!(adjacent_changed_row(&rows, 4, true), None);
+        assert_eq!(adjacent_changed_row(&rows, 4, false), Some(2));
+        assert_eq!(adjacent_changed_row(&rows, 2, false), Some(1));
+        assert_eq!(adjacent_changed_row(&rows, 1, false), None);
+        assert_eq!(adjacent_changed_row(&rows, 3, true), Some(4));
+        assert_eq!(adjacent_changed_row(&rows, 3, false), Some(2));
+    }
+
+    #[test]
+    fn file_navigation_follows_display_path_order() {
+        let files = vec![
+            FileItem {
+                path: "src/b.rs".into(),
+                status: " M".into(),
+            },
+            FileItem {
+                path: "src/a.rs".into(),
+                status: " M".into(),
+            },
+            FileItem {
+                path: "src/c.rs".into(),
+                status: " M".into(),
+            },
+        ];
+
+        assert_eq!(adjacent_file_index(&files, Some(0), true), Some(2));
+        assert_eq!(adjacent_file_index(&files, Some(0), false), Some(1));
+        assert_eq!(adjacent_file_index(&files, Some(2), true), None);
+        assert_eq!(adjacent_file_index(&files, Some(1), false), None);
+    }
+
+    #[test]
     fn split_diff_does_not_highlight_a_missing_side() {
         let missing = side_line(0, None, "", false, true, 0);
         assert!(
@@ -2123,6 +2664,31 @@ mod tests {
             AgentCommentFile::Store { comments } => assert_eq!(comments[0].new_line, Some(9)),
             _ => panic!("wrong shape"),
         }
+    }
+
+    #[test]
+    fn selected_local_comment_can_be_removed_without_affecting_others() {
+        let comment = |summary: &str| ReviewComment {
+            id: new_id(),
+            file_path: "src/main.rs".into(),
+            old_line: None,
+            new_line: Some(1),
+            hunk: None,
+            summary: summary.into(),
+            rationale: None,
+            author: None,
+            source: "user".into(),
+        };
+        let mut store = CommentStore {
+            version: store_version(),
+            comments: vec![comment("first"), comment("second")],
+        };
+
+        let removed = remove_local_comment(&mut store, 0).unwrap();
+        assert_eq!(removed.summary, "first");
+        assert_eq!(store.comments.len(), 1);
+        assert_eq!(store.comments[0].summary, "second");
+        assert!(remove_local_comment(&mut store, 1).is_none());
     }
 
     #[test]
