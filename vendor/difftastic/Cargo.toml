@@ -20,12 +20,6 @@ edition = "2021"
 # package difftastic. Other distros are somewhat newer.
 rust-version = "1.85.0"
 
-[lib]
-# Upstream is a binary crate. Luminatti deliberately exposes its source as a
-# private embedded engine through the same root so it executes the original
-# structural matching implementation in-process.
-path = "src/main.rs"
-
 include = [
         "/build.rs",
         "/src/",
@@ -35,6 +29,12 @@ include = [
         "/LICENSE",
         "/README.md",
 ]
+
+[lib]
+# Upstream is a binary crate. Luminatti deliberately exposes its source as a
+# private embedded engine through the same root so it executes the original
+# structural matching implementation in-process.
+path = "src/main.rs"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ version }/difft-{ version }-{ target }.{ archive-format }"

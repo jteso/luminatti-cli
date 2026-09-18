@@ -72,7 +72,7 @@ use crate::constants::Side;
 use crate::diff::changes::ChangeMap;
 use crate::diff::shortest_path::ExceededGraphLimit;
 use crate::diff::{shortest_path, unchanged};
-use crate::display::context::opposite_positions;
+use crate::display::context::{all_matched_lines_filled, opposite_positions};
 use crate::display::hunks::{matched_pos_to_hunks, merge_adjacent};
 use crate::display::style::print_error;
 use crate::exit_codes::{EXIT_BAD_ARGUMENTS, EXIT_FOUND_CHANGES, EXIT_SUCCESS};
@@ -404,31 +404,66 @@ fn main() {
     };
 }
 
-/// A compact, embeddable view of difftastic's structural correspondence.
-///
-/// This is intentionally small: callers own terminal rendering while the
-/// upstream parser, graph search, and syntax matching logic remains intact.
+/// A renderer-neutral view of a structural diff.
+#[derive(Debug, Clone)]
+pub struct StructuralDiff {
+    pub language: String,
+    pub has_syntactic_changes: bool,
+    pub lines: Vec<StructuralLinePair>,
+}
+
+/// A pair of structurally aligned source lines.
 #[derive(Debug, Clone)]
 pub struct StructuralLinePair {
     pub old_line: Option<u32>,
     pub new_line: Option<u32>,
     pub old_changed: bool,
     pub new_changed: bool,
+    pub old_spans: Vec<StructuralSpan>,
+    pub new_spans: Vec<StructuralSpan>,
 }
 
-/// Calculate syntax-aware, contextual line pairs using difftastic's native
-/// parser and Dijkstra-based matcher. Parse/graph-limit fallbacks are handled
-/// by upstream difftastic exactly as they are in its CLI.
-pub fn structural_line_pairs(
-    display_path: &Path,
-    before: &str,
-    after: &str,
-    context_lines: usize,
-) -> Vec<StructuralLinePair> {
-    let display_options = DisplayOptions {
-        num_context_lines: context_lines as u32,
-        ..DisplayOptions::default()
-    };
+/// A byte range with Difftastic's change and syntax classifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralSpan {
+    pub start: u32,
+    pub end: u32,
+    pub change: StructuralChange,
+    pub highlight: StructuralHighlight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralChange {
+    Unchanged,
+    Novel,
+    NovelWord,
+    NovelContext,
+    Ignored,
+}
+
+impl StructuralChange {
+    pub fn is_changed(self) -> bool {
+        matches!(self, Self::Novel | Self::NovelWord | Self::NovelContext)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralHighlight {
+    Normal,
+    String,
+    Text,
+    Type,
+    Keyword,
+    Comment,
+    Delimiter,
+    TreeSitterError,
+}
+
+/// Calculate syntax-aware line alignment and token classifications using
+/// Difftastic's native parser and Dijkstra-based matcher. Parse and graph-limit
+/// fallbacks are handled by Difftastic exactly as they are in its CLI.
+pub fn structural_diff(display_path: &Path, before: &str, after: &str) -> StructuralDiff {
+    let display_options = DisplayOptions::default();
     let path_argument = FileArgument::NamedPath(display_path.to_path_buf());
     let result = diff_file_content(
         &display_path.to_string_lossy(),
@@ -442,20 +477,115 @@ pub fn structural_line_pairs(
         &[],
     );
 
-    result
-        .hunks
-        .iter()
-        .flat_map(|hunk| {
-            hunk.lines.iter().map(|(old_line, new_line)| StructuralLinePair {
+    let old_lines = crate::lines::split_on_newlines(before).collect::<Vec<_>>();
+    let new_lines = crate::lines::split_on_newlines(after).collect::<Vec<_>>();
+    let mut aligned = all_matched_lines_filled(
+        &result.lhs_positions,
+        &result.rhs_positions,
+        &old_lines,
+        &new_lines,
+    );
+
+    // Byte-identical files return early without position metadata. Retaining
+    // their lines keeps the embedded API useful to interactive callers that
+    // can optionally display unchanged content.
+    if aligned.is_empty() && (!before.is_empty() || !after.is_empty()) {
+        let line_count = old_lines.len().max(new_lines.len());
+        aligned = (0..line_count)
+            .map(|index| {
+                (
+                    (index < old_lines.len()).then(|| (index as u32).into()),
+                    (index < new_lines.len()).then(|| (index as u32).into()),
+                )
+            })
+            .collect();
+    }
+
+    let lines = aligned
+        .into_iter()
+        .map(|(old_line, new_line)| {
+            let old_spans = spans_for_line(old_line, &result.lhs_positions);
+            let new_spans = spans_for_line(new_line, &result.rhs_positions);
+            let old_changed = old_spans.iter().any(|span| span.change.is_changed())
+                || (old_line.is_some() && new_line.is_none());
+            let new_changed = new_spans.iter().any(|span| span.change.is_changed())
+                || (new_line.is_some() && old_line.is_none());
+
+            StructuralLinePair {
                 // `line_numbers::LineNumber` is zero-based internally;
-                // Luminatti's UI and Hunk-compatible metadata are one-based.
+                // embedded consumers generally display one-based line numbers.
                 old_line: old_line.map(|line| line.0 + 1),
                 new_line: new_line.map(|line| line.0 + 1),
-                old_changed: old_line.is_some_and(|line| hunk.novel_lhs.contains(&line)),
-                new_changed: new_line.is_some_and(|line| hunk.novel_rhs.contains(&line)),
-            })
+                old_changed,
+                new_changed,
+                old_spans,
+                new_spans,
+            }
         })
-        .collect()
+        .collect();
+
+    StructuralDiff {
+        language: result.file_format.to_string(),
+        has_syntactic_changes: result.has_syntactic_changes,
+        lines,
+    }
+}
+
+fn spans_for_line(
+    line: Option<line_numbers::LineNumber>,
+    positions: &[syntax::MatchedPos],
+) -> Vec<StructuralSpan> {
+    let Some(line) = line else {
+        return vec![];
+    };
+
+    let mut spans = positions
+        .iter()
+        .filter(|position| position.pos.line == line)
+        .map(|position| StructuralSpan {
+            start: position.pos.start_col,
+            end: position.pos.end_col,
+            change: structural_change(&position.kind),
+            highlight: structural_highlight(&position.kind),
+        })
+        .collect::<Vec<_>>();
+    spans.sort_unstable_by_key(|span| (span.start, span.end));
+    spans
+}
+
+fn structural_change(kind: &syntax::MatchKind) -> StructuralChange {
+    match kind {
+        syntax::MatchKind::UnchangedToken { .. } => StructuralChange::Unchanged,
+        syntax::MatchKind::Novel { .. } => StructuralChange::Novel,
+        syntax::MatchKind::NovelWord { .. } => StructuralChange::NovelWord,
+        syntax::MatchKind::UnchangedPartOfNovelItem { .. } => StructuralChange::NovelContext,
+        syntax::MatchKind::Ignored { .. } => StructuralChange::Ignored,
+    }
+}
+
+fn structural_highlight(kind: &syntax::MatchKind) -> StructuralHighlight {
+    let highlight = match kind {
+        syntax::MatchKind::UnchangedToken { highlight, .. }
+        | syntax::MatchKind::Novel { highlight }
+        | syntax::MatchKind::NovelWord { highlight }
+        | syntax::MatchKind::UnchangedPartOfNovelItem { highlight, .. }
+        | syntax::MatchKind::Ignored { highlight } => highlight,
+    };
+
+    match highlight {
+        syntax::TokenKind::Delimiter => StructuralHighlight::Delimiter,
+        syntax::TokenKind::Atom(atom) => match atom {
+            syntax::AtomKind::Normal | syntax::AtomKind::CanIgnore => StructuralHighlight::Normal,
+            syntax::AtomKind::String(syntax::StringKind::StringLiteral) => {
+                StructuralHighlight::String
+            }
+            syntax::AtomKind::String(syntax::StringKind::Text) => StructuralHighlight::Text,
+            syntax::AtomKind::Type => StructuralHighlight::Type,
+            syntax::AtomKind::Keyword => StructuralHighlight::Keyword,
+            syntax::AtomKind::Comment => StructuralHighlight::Comment,
+            syntax::AtomKind::TreeSitterError => StructuralHighlight::TreeSitterError,
+        },
+    }
 }
 
 /// Print a diff between two files.

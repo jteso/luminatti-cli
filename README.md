@@ -1,8 +1,14 @@
 # Luminatti
 
 Luminatti is a compact, keyboard-first Git worktree diff TUI with mouse support,
-resizable panes, stable line-aligned split and unified diffs, local review notes,
-and agent-readable comments.
+resizable panes, Difftastic-powered structural split and unified diffs, local
+review notes, and agent-readable comments.
+
+Difftastic and its Tree-sitter parsers are embedded in the binary. No separate
+`difft` installation is required. Luminatti preserves Difftastic's structural
+line alignment and token-level change emphasis while using a neutral source
+palette. It also preserves Difftastic's native line-oriented fallbacks for
+unsupported or unparsable inputs.
 
 ```sh
 cargo run --release --bin luminatti -- .

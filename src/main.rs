@@ -32,11 +32,18 @@ use ratatui::{
     },
 };
 use serde::{Deserialize, Serialize};
-use similar::{ChangeTag, TextDiff};
 use uuid::Uuid;
 
+mod diff;
+mod diff_view;
+
+use diff::{
+    DiffRow, adjacent_changed_row, changed_row_indices, diff_document, visible_diff_indices,
+};
+use diff_view::{DiffMode, rendered_diff_indices, side_line, unified_lines};
+
 #[derive(Parser, Debug)]
-#[command(version, about = "Fast line-aligned worktree diff review")]
+#[command(version, about = "Fast syntax-aware worktree diff review")]
 struct Cli {
     /// Directory inside the Git worktree to review
     #[arg(default_value = ".")]
@@ -63,16 +70,6 @@ struct TreeRow {
     expanded: bool,
 }
 
-#[derive(Clone, Debug)]
-struct DiffRow {
-    old_line: Option<u32>,
-    new_line: Option<u32>,
-    old_text: String,
-    new_text: String,
-    old_changed: bool,
-    new_changed: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RightTab {
     Diff,
@@ -88,11 +85,6 @@ enum Focus {
     Files,
     Right,
     Filters,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DiffMode {
-    SideBySide,
-    Unified,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputKind {
@@ -215,6 +207,8 @@ struct App {
     divider: u16,
     dragging_divider: bool,
     diff_rows: Vec<DiffRow>,
+    diff_language: String,
+    diff_has_syntactic_changes: bool,
     diff_scroll: u16,
     diff_signature: Option<u64>,
     input: Option<Input>,
@@ -249,6 +243,8 @@ impl App {
             divider: 34,
             dragging_divider: false,
             diff_rows: vec![],
+            diff_language: String::new(),
+            diff_has_syntactic_changes: false,
             diff_scroll: 0,
             diff_signature: None,
             input: None,
@@ -385,6 +381,8 @@ impl App {
     fn rebuild_diff(&mut self) -> Result<()> {
         let Some(path) = self.active_path().map(str::to_owned) else {
             self.diff_rows.clear();
+            self.diff_language.clear();
+            self.diff_has_syntactic_changes = false;
             self.diff_signature = None;
             return Ok(());
         };
@@ -400,7 +398,10 @@ impl App {
         }
         self.diff_rows.clear();
         self.diff_scroll = 0;
-        self.diff_rows = line_diff_rows(&before, &after);
+        let document = diff_document(Path::new(&path), &before, &after);
+        self.diff_rows = document.rows;
+        self.diff_language = document.language;
+        self.diff_has_syntactic_changes = document.has_syntactic_changes;
         self.selected_row = self
             .diff_rows
             .iter()
@@ -524,109 +525,6 @@ fn flatten_tree(
         if is_directory && expanded {
             flatten_tree(child, &path, depth + 1, collapsed_dirs, rows);
         }
-    }
-}
-
-impl DiffRow {
-    fn is_changed(&self) -> bool {
-        self.old_changed || self.new_changed || self.old_line.is_none() || self.new_line.is_none()
-    }
-}
-
-fn flush_changed_rows(
-    rows: &mut Vec<DiffRow>,
-    deleted: &mut Vec<(u32, String)>,
-    inserted: &mut Vec<(u32, String)>,
-) {
-    let changed_count = deleted.len().max(inserted.len());
-    for index in 0..changed_count {
-        let old = deleted.get(index);
-        let new = inserted.get(index);
-        rows.push(DiffRow {
-            old_line: old.map(|(line, _)| *line),
-            new_line: new.map(|(line, _)| *line),
-            old_text: old.map(|(_, text)| text.clone()).unwrap_or_default(),
-            new_text: new.map(|(_, text)| text.clone()).unwrap_or_default(),
-            old_changed: old.is_some(),
-            new_changed: new.is_some(),
-        });
-    }
-    deleted.clear();
-    inserted.clear();
-}
-
-fn line_diff_rows(before: &str, after: &str) -> Vec<DiffRow> {
-    let diff = TextDiff::from_lines(before, after);
-    let mut old_line = 0u32;
-    let mut new_line = 0u32;
-    let mut rows = vec![];
-    let mut deleted = vec![];
-    let mut inserted = vec![];
-
-    for change in diff.iter_all_changes() {
-        let text = change.value().trim_end_matches('\n').to_string();
-        match change.tag() {
-            ChangeTag::Delete => {
-                old_line += 1;
-                deleted.push((old_line, text));
-            }
-            ChangeTag::Insert => {
-                new_line += 1;
-                inserted.push((new_line, text));
-            }
-            ChangeTag::Equal => {
-                flush_changed_rows(&mut rows, &mut deleted, &mut inserted);
-                old_line += 1;
-                new_line += 1;
-                rows.push(DiffRow {
-                    old_line: Some(old_line),
-                    new_line: Some(new_line),
-                    old_text: text.clone(),
-                    new_text: text,
-                    old_changed: false,
-                    new_changed: false,
-                });
-            }
-        }
-    }
-    flush_changed_rows(&mut rows, &mut deleted, &mut inserted);
-    rows
-}
-
-fn visible_diff_indices(rows: &[DiffRow], show_unchanged: bool) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter_map(|(index, row)| (show_unchanged || row.is_changed()).then_some(index))
-        .collect()
-}
-
-fn rendered_diff_indices(rows: &[DiffRow], show_unchanged: bool, mode: DiffMode) -> Vec<usize> {
-    visible_diff_indices(rows, show_unchanged)
-        .into_iter()
-        .flat_map(|index| {
-            let line_count = if mode == DiffMode::Unified {
-                unified_lines(index, &rows[index], usize::MAX).len()
-            } else {
-                1
-            };
-            std::iter::repeat_n(index, line_count)
-        })
-        .collect()
-}
-
-fn changed_row_indices(rows: &[DiffRow]) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter_map(|(index, row)| row.is_changed().then_some(index))
-        .collect()
-}
-
-fn adjacent_changed_row(rows: &[DiffRow], selected: usize, forward: bool) -> Option<usize> {
-    let changed = changed_row_indices(rows);
-    if forward {
-        changed.into_iter().find(|index| *index > selected)
-    } else {
-        changed.into_iter().rfind(|index| *index < selected)
     }
 }
 
@@ -899,18 +797,6 @@ fn remote_status(repo: &Path) -> RemoteStatus {
             behind: None,
             ahead: None,
         },
-    }
-}
-
-fn changed_style(changed: bool, deletion: bool) -> Style {
-    if changed {
-        Style::default().fg(if deletion {
-            Color::LightRed
-        } else {
-            Color::LightGreen
-        })
-    } else {
-        Style::default().fg(Color::Gray)
     }
 }
 
@@ -1250,9 +1136,13 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let diff_area = inner;
     let visible = visible_diff_indices(&app.diff_rows, app.show_unchanged);
     if visible.is_empty() {
+        let message = if !app.diff_has_syntactic_changes && !app.diff_language.is_empty() {
+            format!("No syntactic changes ({})", app.diff_language)
+        } else {
+            "No changed lines to display.".to_owned()
+        };
         frame.render_widget(
-            Paragraph::new("No changed lines to display.")
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(message).style(Style::default().fg(Color::DarkGray)),
             diff_area,
         );
         return;
@@ -1279,6 +1169,7 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     *index,
                     row.old_line,
                     &row.old_text,
+                    &row.old_spans,
                     row.old_changed,
                     true,
                     app.selected_row,
@@ -1293,6 +1184,7 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     *index,
                     row.new_line,
                     &row.new_text,
+                    &row.new_spans,
                     row.new_changed,
                     false,
                     app.selected_row,
@@ -1319,71 +1211,6 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         scroll,
     );
 }
-fn side_line(
-    index: usize,
-    line: Option<u32>,
-    text: &str,
-    changed: bool,
-    deletion: bool,
-    selected: usize,
-) -> Line<'static> {
-    let prefix = line
-        .map(|n| format!("{:>5} ", n))
-        .unwrap_or_else(|| "      ".into());
-    let mut style = changed_style(changed, deletion);
-    if index == selected && line.is_some() {
-        style = style.bg(Color::DarkGray);
-    }
-    Line::from(vec![
-        Span::styled(prefix, style.add_modifier(Modifier::DIM)),
-        Span::styled(text.to_owned(), style),
-    ])
-}
-fn unified_lines(index: usize, row: &DiffRow, selected: usize) -> Vec<Line<'static>> {
-    let mut result = vec![];
-    if row.old_line.is_some() && (row.old_changed || row.new_line.is_none()) {
-        result.push(unified_line(
-            index,
-            row.old_line,
-            &row.old_text,
-            '-',
-            true,
-            selected,
-        ));
-    }
-    if row.new_line.is_some() {
-        result.push(unified_line(
-            index,
-            row.new_line,
-            &row.new_text,
-            if row.new_changed { '+' } else { ' ' },
-            false,
-            selected,
-        ));
-    }
-    result
-}
-fn unified_line(
-    index: usize,
-    line: Option<u32>,
-    text: &str,
-    marker: char,
-    deletion: bool,
-    selected: usize,
-) -> Line<'static> {
-    let mut style = changed_style(marker != ' ', deletion);
-    if index == selected {
-        style = style.bg(Color::DarkGray);
-    }
-    Line::from(vec![
-        Span::styled(
-            format!("{}{:>5} ", marker, line.unwrap_or(0)),
-            style.add_modifier(Modifier::DIM),
-        ),
-        Span::styled(text.to_owned(), style),
-    ])
-}
-
 fn draw_comments(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let comments = app.all_comments();
     let items: Vec<_> = comments
@@ -2348,6 +2175,10 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    fn test_diff_rows(before: &str, after: &str) -> Vec<DiffRow> {
+        diff_document(Path::new("example.txt"), before, after).rows
+    }
+
     #[test]
     fn panel_tabs_render_in_the_top_border_with_purple_accents() {
         let backend = TestBackend::new(32, 3);
@@ -2584,7 +2415,7 @@ mod tests {
 
     #[test]
     fn line_diff_aligns_replacements_and_tracks_line_numbers() {
-        let rows = line_diff_rows("a\nb\n", "a\nc\n");
+        let rows = test_diff_rows("a\nb\n", "a\nc\n");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].old_line, Some(2));
         assert_eq!(rows[1].new_line, Some(2));
@@ -2596,7 +2427,7 @@ mod tests {
 
     #[test]
     fn bracket_navigation_visits_each_changed_row_including_adjacent_changes() {
-        let rows = line_diff_rows(
+        let rows = test_diff_rows(
             "same\nold one\nold two\nbetween\nold three\nend\n",
             "same\nnew one\nnew two\nbetween\nnew three\nend\n",
         );
@@ -2633,25 +2464,6 @@ mod tests {
         assert_eq!(adjacent_file_index(&files, Some(0), false), Some(1));
         assert_eq!(adjacent_file_index(&files, Some(2), true), None);
         assert_eq!(adjacent_file_index(&files, Some(1), false), None);
-    }
-
-    #[test]
-    fn split_diff_does_not_highlight_a_missing_side() {
-        let missing = side_line(0, None, "", false, true, 0);
-        assert!(
-            missing
-                .spans
-                .iter()
-                .all(|span| span.style.bg != Some(Color::DarkGray))
-        );
-
-        let present = side_line(0, Some(1), "added", true, false, 0);
-        assert!(
-            present
-                .spans
-                .iter()
-                .all(|span| span.style.bg == Some(Color::DarkGray))
-        );
     }
 
     #[test]
@@ -2693,7 +2505,7 @@ mod tests {
 
     #[test]
     fn same_code_filter_can_hide_or_include_unchanged_rows() {
-        let rows = line_diff_rows("same\nold\n", "same\nnew\n");
+        let rows = test_diff_rows("same\nold\n", "same\nnew\n");
         assert_eq!(visible_diff_indices(&rows, false), vec![1]);
         assert_eq!(visible_diff_indices(&rows, true), vec![0, 1]);
         assert_eq!(

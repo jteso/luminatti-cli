@@ -9,6 +9,6 @@ Difftastic is MIT licensed; its full
 license is retained at `vendor/difftastic/LICENSE`.
 
 Difftastic includes Tree-sitter parsers. Their individual licenses remain in
-`vendor/difftastic/vendored_parsers/*/LICENSE` where applicable. The current
-Luminatti renderer uses stable line-aligned correspondence instead of linking
-the vendored engine.
+`vendor/difftastic/vendored_parsers/*/LICENSE` where applicable. Luminatti
+links the vendored engine in-process and renders its structural line alignment,
+token changes, and fallback results in the TUI.
