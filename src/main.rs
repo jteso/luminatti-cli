@@ -45,8 +45,8 @@ use diff::{
     structural_diff_document,
 };
 use diff_view::{
-    DiffMode, RenderedDiffLine, displayed_diff_indices, rendered_diff_lines, side_line,
-    split_separator_line, unified_lines,
+    DiffMode, RenderedDiffLine, SELECTION_BACKGROUND, displayed_diff_indices, pad_selected_line,
+    rendered_diff_lines, side_line, split_separator_line, unified_lines,
 };
 use settings::ProjectSettings;
 
@@ -206,6 +206,9 @@ struct App {
     maximized_panel: Option<Focus>,
     diff_mode: DiffMode,
     show_unchanged: bool,
+    final_view: bool,
+    final_rows: Vec<DiffRow>,
+    final_origin: Option<(usize, usize, u16)>,
     selected_file: usize,
     selected_filter: usize,
     selected_ignored: usize,
@@ -218,6 +221,7 @@ struct App {
     diff_language: String,
     diff_has_syntactic_changes: bool,
     diff_scroll: u16,
+    diff_horizontal_scroll: u16,
     diff_signature: Option<u64>,
     input: Option<Input>,
     confirmation: Option<ConfirmationKind>,
@@ -244,6 +248,9 @@ impl App {
             maximized_panel: None,
             diff_mode: settings.diff_mode,
             show_unchanged: settings.show_unchanged,
+            final_view: false,
+            final_rows: vec![],
+            final_origin: None,
             selected_file: 0,
             selected_filter: 0,
             selected_ignored: 0,
@@ -256,6 +263,7 @@ impl App {
             diff_language: String::new(),
             diff_has_syntactic_changes: false,
             diff_scroll: 0,
+            diff_horizontal_scroll: 0,
             diff_signature: None,
             input: None,
             confirmation: None,
@@ -394,8 +402,11 @@ impl App {
     fn rebuild_diff(&mut self) -> Result<()> {
         let Some(path) = self.active_path().map(str::to_owned) else {
             self.diff_rows.clear();
+            self.final_rows.clear();
+            self.final_origin = None;
             self.diff_language.clear();
             self.diff_has_syntactic_changes = false;
+            self.diff_horizontal_scroll = 0;
             self.diff_signature = None;
             return Ok(());
         };
@@ -411,11 +422,15 @@ impl App {
         }
         self.diff_rows.clear();
         self.diff_scroll = 0;
+        self.diff_horizontal_scroll = 0;
         let document = match self.diff_mode {
             DiffMode::SideBySide => line_diff_document(&before, &after),
             DiffMode::Unified => structural_diff_document(Path::new(&path), &before, &after),
         };
         self.diff_rows = document.rows;
+        // Use physical source lines: structural alignment may rearrange rows.
+        self.final_rows = line_diff_document(&after, &after).rows;
+        self.final_origin = None;
         self.diff_language = document.language;
         self.diff_has_syntactic_changes = document.has_syntactic_changes;
         self.selected_row = self
@@ -423,6 +438,14 @@ impl App {
             .iter()
             .position(DiffRow::is_changed)
             .unwrap_or(0);
+        if self.final_view {
+            self.selected_row = nearest_source_row(
+                &self.final_rows,
+                self.diff_rows
+                    .get(self.selected_row)
+                    .and_then(|row| row.new_line),
+            );
+        }
         self.diff_signature = Some(signature);
         Ok(())
     }
@@ -432,10 +455,12 @@ impl App {
             return Ok(());
         }
         let anchor = self
-            .diff_rows
+            .active_rows()
             .get(self.selected_row)
             .map(|row| (row.old_line, row.new_line));
         self.diff_mode = mode;
+        self.final_view = false;
+        self.final_origin = None;
         self.diff_signature = None;
         self.rebuild_diff()?;
         if let Some((old_line, new_line)) = anchor {
@@ -463,6 +488,92 @@ impl App {
         Ok(())
     }
 
+    fn active_rows(&self) -> &[DiffRow] {
+        if self.final_view {
+            &self.final_rows
+        } else {
+            &self.diff_rows
+        }
+    }
+
+    fn displayed_indices(&self) -> Vec<usize> {
+        displayed_diff_indices(
+            self.active_rows(),
+            self.final_view || self.show_unchanged,
+            self.diff_mode,
+        )
+    }
+
+    fn rendered_lines(&self) -> Vec<RenderedDiffLine> {
+        rendered_diff_lines(
+            self.active_rows(),
+            self.final_view || self.show_unchanged,
+            self.diff_mode,
+        )
+    }
+
+    fn toggle_final_view(&mut self, viewport_height: u16) {
+        let rendered = self.rendered_lines();
+        let selected_position = rendered
+            .iter()
+            .position(|line| line.row_index() == Some(self.selected_row))
+            .unwrap_or(0);
+        let offset = selected_position
+            .saturating_sub(self.diff_scroll as usize)
+            .min(viewport_height.saturating_sub(1) as usize);
+        let anchor = self
+            .active_rows()
+            .get(self.selected_row)
+            .and_then(|row| row.new_line)
+            .or_else(|| {
+                self.active_rows()
+                    .iter()
+                    .skip(self.selected_row)
+                    .find_map(|row| row.new_line)
+            })
+            .or_else(|| {
+                self.active_rows()
+                    .iter()
+                    .take(self.selected_row)
+                    .rev()
+                    .find_map(|row| row.new_line)
+            });
+        if !self.final_view {
+            let target = nearest_source_row(&self.final_rows, anchor);
+            self.final_origin = Some((self.selected_row, target, self.diff_scroll));
+            self.final_view = true;
+            self.selected_row = target;
+        } else {
+            self.final_view = false;
+            if let Some((original, target, scroll)) = self.final_origin.take()
+                && self.selected_row == target
+            {
+                self.selected_row = original;
+                self.diff_scroll = scroll;
+                return;
+            }
+            let visible = self.displayed_indices();
+            self.selected_row = visible
+                .into_iter()
+                .min_by_key(|&index| {
+                    self.diff_rows[index]
+                        .new_line
+                        .map_or(u32::MAX, |line| line.abs_diff(anchor.unwrap_or(1)))
+                })
+                .unwrap_or(0);
+        }
+        let rendered = self.rendered_lines();
+        let position = rendered
+            .iter()
+            .position(|line| line.row_index() == Some(self.selected_row))
+            .unwrap_or(0);
+        self.diff_scroll = clamped_diff_scroll(
+            position.saturating_sub(offset).min(u16::MAX as usize) as u16,
+            rendered.len(),
+            viewport_height,
+        );
+    }
+
     fn save_filters(&self) -> Result<()> {
         save_json(&self.filters_path(), &self.filters)
     }
@@ -480,9 +591,9 @@ impl App {
         let Some(path) = self.active_path().map(str::to_owned) else {
             bail!("choose a changed file first");
         };
-        let row = self.diff_rows.get(self.selected_row);
+        let row = self.active_rows().get(self.selected_row);
         let (old_line, new_line) = row
-            .map(|r| (r.old_line, r.new_line))
+            .map(|r| (if self.final_view { None } else { r.old_line }, r.new_line))
             .unwrap_or((None, None));
         if old_line.is_none() && new_line.is_none() {
             bail!("choose a diff line first");
@@ -615,12 +726,111 @@ fn clamped_diff_scroll(scroll: u16, content_height: usize, viewport_height: u16)
     scroll.min(max_diff_scroll(content_height, viewport_height))
 }
 
+fn diff_content_width(app: &App) -> usize {
+    if app.diff_mode == DiffMode::Unified {
+        return app
+            .displayed_indices()
+            .iter()
+            .flat_map(|index| unified_lines(*index, &app.active_rows()[*index], app.selected_row))
+            .map(|line| line.width())
+            .max()
+            .unwrap_or(0);
+    }
+
+    app.rendered_lines()
+        .iter()
+        .map(|line| match line {
+            RenderedDiffLine::Row(index) => {
+                let row = &app.diff_rows[*index];
+                let old = side_line(
+                    *index,
+                    row.old_line,
+                    &row.old_text,
+                    &row.old_spans,
+                    row.old_changed,
+                    true,
+                    app.selected_row,
+                )
+                .width();
+                let new = side_line(
+                    *index,
+                    row.new_line,
+                    &row.new_text,
+                    &row.new_spans,
+                    row.new_changed,
+                    false,
+                    app.selected_row,
+                )
+                .width();
+                old.max(new)
+            }
+            RenderedDiffLine::Separator => split_separator_line().width(),
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn diff_inner_width(app: &App, terminal_width: u16) -> u16 {
+    let panel_width = match app.maximized_panel {
+        Some(Focus::Right) => terminal_width,
+        Some(_) => 0,
+        None => terminal_width.saturating_sub(constrained_divider(app.divider, terminal_width)),
+    };
+    panel_width.saturating_sub(2)
+}
+
+fn diff_horizontal_viewport_width(app: &App, terminal_width: u16) -> u16 {
+    let inner_width = diff_inner_width(app, terminal_width);
+    if app.diff_mode == DiffMode::Unified {
+        return inner_width;
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(Rect::new(0, 0, inner_width, 1));
+    columns[0].width.min(columns[1].width.saturating_sub(1))
+}
+
+fn max_diff_horizontal_scroll(app: &App, terminal_width: u16) -> u16 {
+    diff_content_width(app)
+        .saturating_sub(diff_horizontal_viewport_width(app, terminal_width) as usize)
+        .min(u16::MAX as usize) as u16
+}
+
+fn move_diff_horizontally(app: &mut App, right: bool, terminal_width: u16) {
+    const STEP: u16 = 4;
+    let max_scroll = max_diff_horizontal_scroll(app, terminal_width);
+    let current = app.diff_horizontal_scroll.min(max_scroll);
+    if right {
+        app.diff_horizontal_scroll = current.saturating_add(STEP).min(max_scroll);
+    } else {
+        app.diff_horizontal_scroll = current.saturating_sub(STEP);
+    }
+}
+
 fn diff_viewport_height(terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(3)
 }
 
+fn active_diff_viewport_height(app: &App, terminal_width: u16, terminal_height: u16) -> u16 {
+    diff_viewport_height(terminal_height).saturating_sub(u16::from(
+        diff_content_width(app) > diff_horizontal_viewport_width(app, terminal_width) as usize,
+    ))
+}
+
+fn nearest_source_row(rows: &[DiffRow], line: Option<u32>) -> usize {
+    rows.iter()
+        .enumerate()
+        .min_by_key(|(_, row)| {
+            row.new_line
+                .map_or(u32::MAX, |n| n.abs_diff(line.unwrap_or(1)))
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
 fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
-    let visible = displayed_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+    let visible = app.displayed_indices();
     if visible.is_empty() {
         return;
     }
@@ -638,7 +848,7 @@ fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
 }
 
 fn scroll_diff_selection_into_view(app: &mut App, viewport_height: u16) {
-    let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
+    let rendered = app.rendered_lines();
     let rendered_start = rendered
         .iter()
         .position(|line| line.row_index() == Some(app.selected_row))
@@ -665,6 +875,11 @@ fn scroll_diff_selection_into_view(app: &mut App, viewport_height: u16) {
 fn move_change_selection(app: &mut App, forward: bool, viewport_height: u16) -> Result<()> {
     app.right_tab = RightTab::Diff;
     app.focus_panel(Focus::Right);
+
+    // Change navigation returns to the diff so deletions have a visible target.
+    if app.final_view {
+        app.toggle_final_view(viewport_height);
+    }
 
     if let Some(target) = adjacent_changed_row(&app.diff_rows, app.selected_row, forward) {
         app.selected_row = target;
@@ -707,7 +922,7 @@ fn move_file_selection(app: &mut App, forward: bool) -> Result<()> {
 
 fn toggle_unchanged(app: &mut App) {
     app.show_unchanged = !app.show_unchanged;
-    let displayed = displayed_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+    let displayed = app.displayed_indices();
     if !app.show_unchanged && !displayed.contains(&app.selected_row) {
         app.selected_row = app
             .diff_rows
@@ -1044,7 +1259,7 @@ fn accent_style() -> Style {
 }
 
 fn selected_row_style() -> Style {
-    accent_style().bg(Color::DarkGray)
+    accent_style().bg(SELECTION_BACKGROUND)
 }
 
 fn rounded_block<'a>() -> Block<'a> {
@@ -1094,6 +1309,29 @@ fn render_vertical_scrollbar(
         }),
         &mut state,
     );
+}
+
+fn render_horizontal_scrollbar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    content_length: usize,
+    viewport_length: usize,
+    offset: usize,
+) {
+    if content_length <= viewport_length || viewport_length == 0 || area.width == 0 {
+        return;
+    }
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("─"))
+        .track_style(Style::default().fg(Color::DarkGray))
+        .thumb_symbol("━")
+        .thumb_style(accent_style());
+    let mut state = ScrollbarState::new(content_length)
+        .position(scrollbar_position(content_length, viewport_length, offset))
+        .viewport_content_length(viewport_length);
+    frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
 fn single_panel_block(panel: &'static str, title: &'static str, focused: bool) -> Block<'static> {
@@ -1151,7 +1389,7 @@ fn panel_block(
 
 fn right_panel_block(app: &App, changes_active: bool, comments_active: bool) -> Block<'static> {
     let path = app.active_path().unwrap_or("No changed file");
-    let block = panel_block(
+    let mut block = panel_block(
         "[2]",
         "Changes",
         changes_active,
@@ -1159,6 +1397,12 @@ fn right_panel_block(app: &App, changes_active: bool, comments_active: bool) -> 
         comments_active,
         app.focus == Focus::Right,
     );
+    if app.final_view && changes_active {
+        block = block.title_bottom(Line::from(Span::styled(
+            " Final · [h] show diff ",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     if let Some(title) = right_panel_path_title(path, comments_active) {
         block.title(title)
     } else {
@@ -1191,9 +1435,11 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let diff_area = inner;
-    let visible = displayed_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+    let visible = app.displayed_indices();
     if visible.is_empty() {
-        let message = if !app.diff_has_syntactic_changes && !app.diff_language.is_empty() {
+        let message = if app.final_view {
+            "Final version is empty (file empty or deleted).".to_owned()
+        } else if !app.diff_has_syntactic_changes && !app.diff_language.is_empty() {
             format!("No syntactic changes ({})", app.diff_language)
         } else {
             "No changed lines to display.".to_owned()
@@ -1204,75 +1450,160 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let (content_length, scroll) = if app.diff_mode == DiffMode::Unified {
-        let lines: Vec<_> = visible
-            .iter()
-            .flat_map(|index| unified_lines(*index, &app.diff_rows[*index], app.selected_row))
-            .collect();
-        let scroll = clamped_diff_scroll(app.diff_scroll, lines.len(), diff_area.height);
-        let content_length = lines.len();
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), diff_area);
-        (content_length, scroll as usize)
-    } else {
-        let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(diff_area);
-        let old: Vec<_> = rendered
-            .iter()
-            .map(|line| match line {
-                RenderedDiffLine::Row(index) => {
-                    let row = &app.diff_rows[*index];
-                    side_line(
-                        *index,
-                        row.old_line,
-                        &row.old_text,
-                        &row.old_spans,
-                        row.old_changed,
-                        true,
-                        app.selected_row,
-                    )
-                }
-                RenderedDiffLine::Separator => split_separator_line(),
-            })
-            .collect();
-        let new: Vec<_> = rendered
-            .iter()
-            .map(|line| match line {
-                RenderedDiffLine::Row(index) => {
-                    let row = &app.diff_rows[*index];
-                    side_line(
-                        *index,
-                        row.new_line,
-                        &row.new_text,
-                        &row.new_spans,
-                        row.new_changed,
-                        false,
-                        app.selected_row,
-                    )
-                }
-                RenderedDiffLine::Separator => split_separator_line(),
-            })
-            .collect();
-        let scroll = clamped_diff_scroll(app.diff_scroll, rendered.len(), diff_area.height);
-        frame.render_widget(Paragraph::new(old).scroll((scroll, 0)), columns[0]);
-        frame.render_widget(
-            Paragraph::new(new).scroll((scroll, 0)).block(
-                rounded_block()
-                    .borders(Borders::LEFT)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-            columns[1],
-        );
-        (rendered.len(), scroll as usize)
-    };
+    let (content_length, scroll, horizontal_content, horizontal_viewport, horizontal_scroll) =
+        if app.diff_mode == DiffMode::Unified {
+            let mut lines: Vec<_> = visible
+                .iter()
+                .flat_map(|index| {
+                    unified_lines(*index, &app.active_rows()[*index], app.selected_row)
+                })
+                .collect();
+            let horizontal_content = lines.iter().map(Line::width).max().unwrap_or(0);
+            let horizontal_viewport = diff_area.width as usize;
+            let horizontal_scroll = app.diff_horizontal_scroll.min(
+                horizontal_content
+                    .saturating_sub(horizontal_viewport)
+                    .min(u16::MAX as usize) as u16,
+            );
+            let has_horizontal_scroll = horizontal_content > horizontal_viewport;
+            let content_area = Rect {
+                height: diff_area
+                    .height
+                    .saturating_sub(u16::from(has_horizontal_scroll)),
+                ..diff_area
+            };
+            let padded_width = horizontal_content
+                .max(horizontal_viewport)
+                .min(u16::MAX as usize) as u16;
+            lines = lines
+                .into_iter()
+                .map(|line| pad_selected_line(line, padded_width))
+                .collect();
+            let scroll = clamped_diff_scroll(app.diff_scroll, lines.len(), content_area.height);
+            let content_length = lines.len();
+            frame.render_widget(
+                Paragraph::new(lines).scroll((scroll, horizontal_scroll)),
+                content_area,
+            );
+            (
+                content_length,
+                scroll as usize,
+                horizontal_content,
+                horizontal_viewport,
+                horizontal_scroll as usize,
+            )
+        } else {
+            let rendered = app.rendered_lines();
+            let initial_columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(diff_area);
+            let mut old: Vec<_> = rendered
+                .iter()
+                .map(|line| match line {
+                    RenderedDiffLine::Row(index) => {
+                        let row = &app.diff_rows[*index];
+                        side_line(
+                            *index,
+                            row.old_line,
+                            &row.old_text,
+                            &row.old_spans,
+                            row.old_changed,
+                            true,
+                            app.selected_row,
+                        )
+                    }
+                    RenderedDiffLine::Separator => split_separator_line(),
+                })
+                .collect();
+            let mut new: Vec<_> = rendered
+                .iter()
+                .map(|line| match line {
+                    RenderedDiffLine::Row(index) => {
+                        let row = &app.diff_rows[*index];
+                        side_line(
+                            *index,
+                            row.new_line,
+                            &row.new_text,
+                            &row.new_spans,
+                            row.new_changed,
+                            false,
+                            app.selected_row,
+                        )
+                    }
+                    RenderedDiffLine::Separator => split_separator_line(),
+                })
+                .collect();
+            let horizontal_content = old.iter().chain(&new).map(Line::width).max().unwrap_or(0);
+            let horizontal_viewport = initial_columns[0]
+                .width
+                .min(initial_columns[1].width.saturating_sub(1))
+                as usize;
+            let horizontal_scroll = app.diff_horizontal_scroll.min(
+                horizontal_content
+                    .saturating_sub(horizontal_viewport)
+                    .min(u16::MAX as usize) as u16,
+            );
+            let has_horizontal_scroll = horizontal_content > horizontal_viewport;
+            let content_area = Rect {
+                height: diff_area
+                    .height
+                    .saturating_sub(u16::from(has_horizontal_scroll)),
+                ..diff_area
+            };
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(content_area);
+            let padded_width = horizontal_content
+                .max(horizontal_viewport)
+                .min(u16::MAX as usize) as u16;
+            old = old
+                .into_iter()
+                .map(|line| pad_selected_line(line, padded_width))
+                .collect();
+            new = new
+                .into_iter()
+                .map(|line| pad_selected_line(line, padded_width))
+                .collect();
+            let scroll = clamped_diff_scroll(app.diff_scroll, rendered.len(), content_area.height);
+            frame.render_widget(
+                Paragraph::new(old).scroll((scroll, horizontal_scroll)),
+                columns[0],
+            );
+            frame.render_widget(
+                Paragraph::new(new)
+                    .scroll((scroll, horizontal_scroll))
+                    .block(
+                        rounded_block()
+                            .borders(Borders::LEFT)
+                            .border_style(Style::default().fg(Color::DarkGray)),
+                    ),
+                columns[1],
+            );
+            (
+                rendered.len(),
+                scroll as usize,
+                horizontal_content,
+                horizontal_viewport,
+                horizontal_scroll as usize,
+            )
+        };
     render_vertical_scrollbar(
         frame,
         area,
         content_length,
-        diff_area.height as usize,
+        diff_area
+            .height
+            .saturating_sub(u16::from(horizontal_content > horizontal_viewport)) as usize,
         scroll,
+    );
+    render_horizontal_scrollbar(
+        frame,
+        diff_area,
+        horizontal_content,
+        horizontal_viewport,
+        horizontal_scroll,
     );
 }
 fn draw_comments(frame: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -1394,6 +1725,7 @@ fn shortcut_line(app: &App) -> Line<'static> {
         (Focus::Right, RightTab::Diff, _) => {
             push_shortcut(&mut spans, "Tab", "next tab");
             push_shortcut(&mut spans, "↑/↓", "line");
+            push_shortcut(&mut spans, "←/→", "scroll");
             push_shortcut_display(&mut spans, "[ / ]", "change");
             push_shortcut_display(&mut spans, "{ / }", "file");
             push_shortcut(&mut spans, "c", "comment");
@@ -1401,16 +1733,27 @@ fn shortcut_line(app: &App) -> Line<'static> {
                 push_shortcut(&mut spans, "u", "unified");
             } else {
                 push_shortcut(&mut spans, "s", "split");
+                push_shortcut(
+                    &mut spans,
+                    "h",
+                    if app.final_view {
+                        "show diff"
+                    } else {
+                        "show final"
+                    },
+                );
             }
-            push_shortcut(
-                &mut spans,
-                "i",
-                if app.show_unchanged {
-                    "hide common"
-                } else {
-                    "show common"
-                },
-            );
+            if !app.final_view {
+                push_shortcut(
+                    &mut spans,
+                    "i",
+                    if app.show_unchanged {
+                        "hide common"
+                    } else {
+                        "show common"
+                    },
+                );
+            }
         }
         (Focus::Right, RightTab::Comments, _) => {
             push_shortcut(&mut spans, "Tab", "next tab");
@@ -1482,7 +1825,7 @@ fn help_heading(title: &'static str) -> Line<'static> {
 
 fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
     let width = 76.min(area.width.saturating_sub(2)).max(1);
-    let height = 33.min(area.height.saturating_sub(2)).max(1);
+    let height = 34.min(area.height.saturating_sub(1)).max(1);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1493,7 +1836,7 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         help_heading("GLOBAL"),
         help_binding("1 / 2 / 3", "focus panel; repeat to maximize / restore"),
         help_binding("Tab", "cycle tabs within the focused panel"),
-        help_binding("h / l", "focus files / changes"),
+        help_binding("f / l", "focus files / changes"),
         help_binding("< / >", "narrow / widen focused panel"),
         help_binding("[ / ]", "previous / next changed row or file"),
         help_binding("{ / }", "previous / next changed file"),
@@ -1508,7 +1851,8 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         Line::default(),
         help_heading("[2] CHANGES"),
         help_binding("↑ / ↓", "move through changed lines"),
-        help_binding("u / s", "unified / split view"),
+        help_binding("← / →", "scroll code horizontally"),
+        help_binding("u / s · h", "unified / split; h toggles final in unified"),
         help_binding("i", "show or hide common lines"),
         help_binding("c", "add review comment"),
         Line::default(),
@@ -1880,6 +2224,12 @@ fn handle_key(
             })
         }
         KeyCode::Tab => cycle_focused_panel_tab(app.focus, &mut app.right_tab, &mut app.filter_tab),
+        KeyCode::Char('h')
+            if app.right_tab == RightTab::Diff && app.diff_mode == DiffMode::Unified =>
+        {
+            let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
+            app.toggle_final_view(viewport);
+        }
         KeyCode::Char('h') => app.focus_panel(Focus::Files),
         KeyCode::Char('l') => app.focus_panel(Focus::Right),
         KeyCode::Char('<') => {
@@ -1889,10 +2239,12 @@ fn handle_key(
             resize_focused_panel(&mut app.divider, app.focus, true, terminal_width)
         }
         KeyCode::Char('[') => {
-            move_change_selection(app, false, diff_viewport_height(terminal_height))?
+            let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
+            move_change_selection(app, false, viewport)?
         }
         KeyCode::Char(']') => {
-            move_change_selection(app, true, diff_viewport_height(terminal_height))?
+            let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
+            move_change_selection(app, true, viewport)?
         }
         KeyCode::Char('{') => move_file_selection(app, false)?,
         KeyCode::Char('}') => move_file_selection(app, true)?,
@@ -1912,7 +2264,9 @@ fn handle_key(
         KeyCode::Char('s') => {
             app.set_diff_mode(DiffMode::SideBySide)?;
         }
-        KeyCode::Char('i') if app.right_tab == RightTab::Diff => toggle_unchanged(app),
+        KeyCode::Char('i') if app.right_tab == RightTab::Diff && !app.final_view => {
+            toggle_unchanged(app)
+        }
         KeyCode::Char('r') => {
             app.refresh()?;
             app.message = "refreshed".into();
@@ -1956,7 +2310,8 @@ fn handle_key(
                 }
             }
             (Focus::Right, RightTab::Diff) => {
-                move_diff_selection(app, true, diff_viewport_height(terminal_height));
+                let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
+                move_diff_selection(app, true, viewport);
             }
             (Focus::Right, RightTab::Comments) => {
                 let comment_count = app.local_comments.comments.len() + app.agent_comments.len();
@@ -1976,13 +2331,20 @@ fn handle_key(
                 }
             }
             (Focus::Right, RightTab::Diff) => {
-                move_diff_selection(app, false, diff_viewport_height(terminal_height));
+                let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
+                move_diff_selection(app, false, viewport);
             }
             (Focus::Right, RightTab::Comments) => {
                 let comment_count = app.local_comments.comments.len() + app.agent_comments.len();
                 move_selection(&mut app.selected_comment, comment_count, false)
             }
         },
+        KeyCode::Left if app.focus == Focus::Right && app.right_tab == RightTab::Diff => {
+            move_diff_horizontally(app, false, terminal_width)
+        }
+        KeyCode::Right if app.focus == Focus::Right && app.right_tab == RightTab::Diff => {
+            move_diff_horizontally(app, true, terminal_width)
+        }
         KeyCode::Enter if app.focus == Focus::Files => {
             if app.active_file_index().is_some() {
                 app.rebuild_diff()?;
@@ -2005,7 +2367,7 @@ fn handle_mouse(
         return Ok(());
     }
     if let Some(panel) = app.maximized_panel {
-        return handle_maximized_mouse(app, panel, mouse, terminal_height);
+        return handle_maximized_mouse(app, panel, mouse, terminal_width, terminal_height);
     }
     let divider = constrained_divider(app.divider, terminal_width);
     let left_panels = left_panel_areas(Rect::new(0, 0, divider, terminal_height.saturating_sub(1)));
@@ -2067,12 +2429,11 @@ fn handle_mouse(
             } else {
                 app.focus_panel(Focus::Right);
                 if app.right_tab == RightTab::Diff {
-                    let rendered =
-                        rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
+                    let rendered = app.rendered_lines();
                     let scroll = clamped_diff_scroll(
                         app.diff_scroll,
                         rendered.len(),
-                        diff_viewport_height(terminal_height),
+                        active_diff_viewport_height(app, terminal_width, terminal_height),
                     );
                     let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
                     if let Some(index) = rendered.get(position).and_then(|line| line.row_index()) {
@@ -2087,15 +2448,25 @@ fn handle_mouse(
         MouseEventKind::ScrollDown
             if app.right_tab == RightTab::Diff && mouse.column >= divider =>
         {
-            let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
+            let rendered = app.rendered_lines();
             app.diff_scroll = clamped_diff_scroll(
                 app.diff_scroll.saturating_add(3),
                 rendered.len(),
-                diff_viewport_height(terminal_height),
+                active_diff_viewport_height(app, terminal_width, terminal_height),
             );
         }
         MouseEventKind::ScrollUp if app.right_tab == RightTab::Diff && mouse.column >= divider => {
             app.diff_scroll = app.diff_scroll.saturating_sub(3);
+        }
+        MouseEventKind::ScrollRight
+            if app.right_tab == RightTab::Diff && mouse.column >= divider =>
+        {
+            move_diff_horizontally(app, true, terminal_width);
+        }
+        MouseEventKind::ScrollLeft
+            if app.right_tab == RightTab::Diff && mouse.column >= divider =>
+        {
+            move_diff_horizontally(app, false, terminal_width);
         }
         _ => {}
     }
@@ -2106,6 +2477,7 @@ fn handle_maximized_mouse(
     app: &mut App,
     panel: Focus,
     mouse: crossterm::event::MouseEvent,
+    terminal_width: u16,
     terminal_height: u16,
 ) -> Result<()> {
     match mouse.kind {
@@ -2145,12 +2517,11 @@ fn handle_maximized_mouse(
                 }
             }
             Focus::Right if app.right_tab == RightTab::Diff => {
-                let rendered =
-                    rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
+                let rendered = app.rendered_lines();
                 let scroll = clamped_diff_scroll(
                     app.diff_scroll,
                     rendered.len(),
-                    diff_viewport_height(terminal_height),
+                    active_diff_viewport_height(app, terminal_width, terminal_height),
                 );
                 let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
                 if let Some(index) = rendered.get(position).and_then(|line| line.row_index()) {
@@ -2164,15 +2535,21 @@ fn handle_maximized_mouse(
             Focus::Files => {}
         },
         MouseEventKind::ScrollDown if panel == Focus::Right && app.right_tab == RightTab::Diff => {
-            let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
+            let rendered = app.rendered_lines();
             app.diff_scroll = clamped_diff_scroll(
                 app.diff_scroll.saturating_add(3),
                 rendered.len(),
-                diff_viewport_height(terminal_height),
+                active_diff_viewport_height(app, terminal_width, terminal_height),
             );
         }
         MouseEventKind::ScrollUp if panel == Focus::Right && app.right_tab == RightTab::Diff => {
             app.diff_scroll = app.diff_scroll.saturating_sub(3);
+        }
+        MouseEventKind::ScrollRight if panel == Focus::Right && app.right_tab == RightTab::Diff => {
+            move_diff_horizontally(app, true, terminal_width);
+        }
+        MouseEventKind::ScrollLeft if panel == Focus::Right && app.right_tab == RightTab::Diff => {
+            move_diff_horizontally(app, false, terminal_width);
         }
         _ => {}
     }
@@ -2247,6 +2624,138 @@ mod tests {
         structural_diff_document(Path::new("example.txt"), before, after).rows
     }
 
+    fn preview_app(before: &str, after: &str) -> App {
+        App {
+            repo: PathBuf::new(),
+            files: vec![],
+            ignored_files: vec![],
+            filters: FilterStore::default(),
+            local_comments: CommentStore::default(),
+            agent_comments: vec![],
+            right_tab: RightTab::Diff,
+            filter_tab: FilterTab::Filters,
+            focus: Focus::Right,
+            maximized_panel: None,
+            diff_mode: DiffMode::Unified,
+            show_unchanged: false,
+            final_view: false,
+            final_rows: line_diff_document(after, after).rows,
+            final_origin: None,
+            selected_file: 0,
+            selected_filter: 0,
+            selected_ignored: 0,
+            selected_comment: 0,
+            selected_row: 0,
+            collapsed_dirs: BTreeSet::new(),
+            divider: 34,
+            dragging_divider: false,
+            diff_rows: test_diff_rows(before, after),
+            diff_language: String::new(),
+            diff_has_syntactic_changes: true,
+            diff_scroll: 0,
+            diff_horizontal_scroll: 0,
+            diff_signature: None,
+            input: None,
+            confirmation: None,
+            show_help: false,
+            message: String::new(),
+            remote: RemoteStatus::default(),
+            last_refresh: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn final_toggle_shows_complete_source_and_restores_deleted_selection() {
+        let mut app = preview_app("first\nremoved\nlast\n", "first\nlast\n");
+        app.selected_row = app
+            .diff_rows
+            .iter()
+            .position(|row| row.new_line.is_none())
+            .unwrap();
+        let deleted = app.selected_row;
+        handle_key(&mut app, KeyCode::Char('h'), 100, 20).unwrap();
+        assert!(app.final_view);
+        assert_eq!(app.focus, Focus::Right);
+        assert_eq!(app.displayed_indices(), vec![0, 1]);
+        assert_eq!(
+            app.active_rows()
+                .iter()
+                .map(|row| row.new_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "last"]
+        );
+        assert_eq!(app.selected_row, 1);
+        handle_key(&mut app, KeyCode::Char('i'), 100, 20).unwrap();
+        assert!(!app.show_unchanged);
+        handle_key(&mut app, KeyCode::Char('h'), 100, 20).unwrap();
+        assert!(!app.final_view);
+        assert_eq!(app.selected_row, deleted);
+        assert!(!app.show_unchanged);
+    }
+
+    #[test]
+    fn final_toggle_is_available_when_another_panel_is_focused() {
+        let mut app = preview_app("old\n", "new\n");
+
+        app.focus = Focus::Files;
+        handle_key(&mut app, KeyCode::Char('h'), 100, 20).unwrap();
+        assert!(app.final_view);
+        assert_eq!(app.focus, Focus::Files);
+
+        app.focus = Focus::Filters;
+        handle_key(&mut app, KeyCode::Char('h'), 100, 20).unwrap();
+        assert!(!app.final_view);
+        assert_eq!(app.focus, Focus::Filters);
+    }
+
+    #[test]
+    fn final_navigation_and_mouse_use_physical_source_lines() {
+        let mut app = preview_app("first\nold\nlast\n", "first\nnew\nlast\n");
+        app.show_unchanged = true;
+        handle_key(&mut app, KeyCode::Char('h'), 100, 20).unwrap();
+        handle_key(&mut app, KeyCode::Down, 100, 20).unwrap();
+        assert_eq!(app.active_rows()[app.selected_row].new_text, "new");
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 50,
+                row: 3,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            100,
+            20,
+        )
+        .unwrap();
+        assert_eq!(app.active_rows()[app.selected_row].new_text, "last");
+        handle_key(&mut app, KeyCode::Char('h'), 100, 20).unwrap();
+        assert_eq!(app.active_rows()[app.selected_row].new_line, Some(3));
+        assert!(app.show_unchanged);
+    }
+
+    #[test]
+    fn final_view_renders_neutral_numbered_source_and_handles_empty_files() {
+        let mut app = preview_app("old\n", "new\n");
+        app.toggle_final_view(5);
+        let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
+        terminal
+            .draw(|frame| draw_diff(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let source: String = (1..20).map(|x| buffer[(x, 1)].symbol()).collect();
+        assert!(source.starts_with("     1 new"));
+        assert_eq!(buffer[(8, 1)].fg, Color::Gray);
+        assert!(!buffer[(8, 1)].modifier.contains(Modifier::CROSSED_OUT));
+        let mut empty = preview_app("removed\n", "");
+        empty.toggle_final_view(5);
+        assert!(empty.rendered_lines().is_empty());
+        terminal
+            .draw(|frame| draw_diff(frame, &empty, frame.area()))
+            .unwrap();
+        empty.toggle_final_view(5);
+        assert!(!empty.rendered_lines().is_empty());
+    }
+
     #[test]
     fn panel_tabs_render_in_the_top_border_with_purple_accents() {
         let backend = TestBackend::new(32, 3);
@@ -2294,7 +2803,7 @@ mod tests {
         assert!(contents.contains("──────── GLOBAL ────────"));
         assert!(contents.contains("──────── [1] FILES ────────"));
 
-        let popup = Rect::new(2, 1, 76, 33);
+        let popup = Rect::new(2, 0, 76, 34);
         let bottom_border = (popup.x..popup.x + popup.width)
             .map(|x| buffer[(x, popup.y + popup.height - 1)].symbol())
             .collect::<String>();
@@ -2432,6 +2941,32 @@ mod tests {
         assert_eq!(clamped_diff_scroll(12, 22, 40), 0);
         assert_eq!(max_diff_scroll(60, 40), 20);
         assert_eq!(clamped_diff_scroll(30, 60, 40), 20);
+    }
+
+    #[test]
+    fn horizontal_scroll_moves_both_split_columns_together() {
+        let before = "shared-prefix-old-abcdefghijklmnopqrstuvwxyz\n";
+        let after = "shared-prefix-new-abcdefghijklmnopqrstuvwxyz\n";
+        let mut app = preview_app(before, after);
+        app.diff_mode = DiffMode::SideBySide;
+        app.diff_rows = line_diff_document(before, after).rows;
+        app.maximized_panel = Some(Focus::Right);
+
+        handle_key(&mut app, KeyCode::Right, 50, 8).unwrap();
+        assert_eq!(app.diff_horizontal_scroll, 4);
+        handle_key(&mut app, KeyCode::Left, 50, 8).unwrap();
+        assert_eq!(app.diff_horizontal_scroll, 0);
+
+        app.diff_horizontal_scroll = 6;
+        let mut terminal = Terminal::new(TestBackend::new(50, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_diff(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(1, 1)].symbol(), "s");
+        assert_eq!(buffer[(26, 1)].symbol(), "s");
+        assert!((1..49).any(|x| buffer[(x, 6)].symbol() == "━"));
     }
 
     #[test]

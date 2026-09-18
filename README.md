@@ -32,13 +32,15 @@ This installs `luminatti` to `~/.local/bin` by default. Set `BIN_DIR` or
 ## Keys
 
 `Tab` cycles tabs within the focused panel and never changes panel focus;
-`h`/`l` focus the left files or right diff pane. `1`, `2`, and `3` focus their
+`h`/`l` focus the left files or right diff pane, except when unified Changes is
+active, where `h` toggles Diff / Final from any focused panel. `1`, `2`, and `3` focus their
 numbered panels; pressing the focused panel's number again maximizes it, and a
 third press restores the normal layout. Use `<`/`>` to narrow or widen the focused
 panel. `[`/`]` move to the previous/next changed row, crossing into the adjacent
 changed file at file boundaries; `{`/`}` jump directly to the previous/next
 changed file. `f` focuses Files, `u` selects unified view,
-and `s` selects split view. In the focused Comments tab,
+and `s` selects split view. In Changes, `Left`/`Right` scroll code horizontally;
+split columns share one offset and move together. In the focused Comments tab,
 `d` deletes the selected local comment and `D` deletes all local comments;
 the latter asks for `Enter` confirmation and accepts `Esc` to cancel.
 Agent-provided comments remain read-only.
@@ -47,6 +49,11 @@ comment, `a` adds a filter, `x` removes one, `r` refreshes, `?` opens the
 grouped keybinding help, and `q` quits. Use the arrow keys to move. `/` opens
 a fuzzy changed-file picker; type to filter and press `Enter` to open the
 selected file. Drag the vertical divider to resize panels.
+In unified view, removed lines have an empty number gutter, muted text, and
+strikethrough. Final shows the complete current file with neutral text and normal
+line numbers. Toggling preserves your place and your common-line preference;
+`i` only applies to Diff. Use `f` or `1` to focus Files while in unified view.
+Change navigation (`[` / `]`) returns to Diff so removed lines remain reachable.
 The Files pane is a changed-only directory tree; `Enter` toggles a directory
 and opens the selected file's diff. Filters remain visible in their own panel
 at the bottom of the left column. Its Ignored tab lists changed files excluded

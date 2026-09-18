@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{DiffRow, DiffSpan, StructuralChange, visible_diff_indices};
 
 const SPLIT_CONTEXT_LINES: usize = 3;
+pub(crate) const SELECTION_BACKGROUND: Color = Color::Rgb(62, 68, 81);
+
+pub(crate) fn pad_selected_line(mut line: Line<'static>, width: u16) -> Line<'static> {
+    if line.style.bg == Some(SELECTION_BACKGROUND) {
+        let padding = (width as usize).saturating_sub(line.width());
+        line.spans.push(Span::raw(" ".repeat(padding)));
+    }
+    line
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,7 +138,7 @@ pub(crate) fn side_line(
     rendered.extend(styled_source_spans(
         text, spans, changed, deletion, selected,
     ));
-    Line::from(rendered)
+    Line::from(rendered).style(selected_style(Style::default(), selected))
 }
 
 pub(crate) fn unified_lines(index: usize, row: &DiffRow, selected: usize) -> Vec<Line<'static>> {
@@ -172,13 +181,63 @@ fn unified_line(
     let changed = marker != ' ';
     let prefix_style = selected_style(changed_style(changed, deletion), selected);
     let mut rendered = vec![Span::styled(
-        format!("{}{:>5} ", marker, line.unwrap_or(0)),
-        prefix_style.add_modifier(Modifier::DIM),
+        if deletion {
+            "-      ".to_owned()
+        } else {
+            format!("{}{:>5} ", marker, line.unwrap_or(0))
+        },
+        if deletion {
+            selected_style(Style::default().fg(Color::Rgb(165, 112, 116)), selected)
+        } else {
+            prefix_style
+        }
+        .add_modifier(Modifier::DIM),
     )];
-    rendered.extend(styled_source_spans(
-        text, spans, changed, deletion, selected,
-    ));
-    Line::from(rendered)
+    let source_spans = styled_source_spans(text, spans, changed, deletion, selected);
+    let mut source = Vec::with_capacity(source_spans.len());
+    let mut deletion_content_started = false;
+    for span in source_spans {
+        let mut style = span.style.remove_modifier(Modifier::UNDERLINED);
+        if deletion {
+            let color = if style.fg == Some(Color::LightRed) {
+                Color::Rgb(165, 112, 116)
+            } else {
+                Color::Rgb(140, 143, 150)
+            };
+            style = style.fg(color).remove_modifier(Modifier::BOLD);
+        }
+
+        let content = span.content.into_owned();
+        if !deletion {
+            source.push(Span::styled(content, style));
+            continue;
+        }
+        if deletion_content_started {
+            source.push(Span::styled(
+                content,
+                style.add_modifier(Modifier::CROSSED_OUT),
+            ));
+            continue;
+        }
+        let Some(content_start) = content
+            .char_indices()
+            .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
+        else {
+            source.push(Span::styled(content, style));
+            continue;
+        };
+
+        deletion_content_started = true;
+        if content_start > 0 {
+            source.push(Span::styled(content[..content_start].to_owned(), style));
+        }
+        source.push(Span::styled(
+            content[content_start..].to_owned(),
+            style.add_modifier(Modifier::CROSSED_OUT),
+        ));
+    }
+    rendered.extend(source);
+    Line::from(rendered).style(selected_style(Style::default(), selected))
 }
 
 fn styled_source_spans(
@@ -257,7 +316,7 @@ fn diff_span_style(span: &DiffSpan, deletion: bool) -> Style {
 
 fn selected_style(style: Style, selected: bool) -> Style {
     if selected {
-        style.bg(Color::DarkGray)
+        style.bg(SELECTION_BACKGROUND)
     } else {
         style
     }
@@ -278,7 +337,7 @@ mod tests {
             missing
                 .spans
                 .iter()
-                .all(|span| span.style.bg != Some(Color::DarkGray))
+                .all(|span| span.style.bg != Some(SELECTION_BACKGROUND))
         );
 
         let present = side_line(0, Some(1), "added", &[], true, false, 0);
@@ -286,7 +345,7 @@ mod tests {
             present
                 .spans
                 .iter()
-                .all(|span| span.style.bg == Some(Color::DarkGray))
+                .all(|span| span.style.bg == Some(SELECTION_BACKGROUND))
         );
     }
 
@@ -311,6 +370,56 @@ mod tests {
         assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
         assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(line.spans.last().unwrap().style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn unified_view_does_not_underline_changed_words() {
+        let spans = vec![DiffSpan {
+            start: 0,
+            end: 7,
+            change: StructuralChange::NovelWord,
+            highlight: StructuralHighlight::Normal,
+        }];
+
+        for (marker, deletion) in [('-', true), ('+', false)] {
+            let line = unified_line(0, Some(1), "changed", &spans, marker, deletion, usize::MAX);
+            let changed_word = &line.spans[1];
+
+            assert!(
+                !changed_word
+                    .style
+                    .add_modifier
+                    .contains(Modifier::UNDERLINED)
+            );
+        }
+    }
+
+    #[test]
+    fn unified_deletion_strikethrough_starts_after_indentation() {
+        let text = "    removed";
+        let spans = vec![DiffSpan {
+            start: 0,
+            end: text.len(),
+            change: StructuralChange::NovelWord,
+            highlight: StructuralHighlight::Normal,
+        }];
+
+        let line = unified_line(0, Some(1), text, &spans, '-', true, usize::MAX);
+
+        assert_eq!(line.spans[1].content, "    ");
+        assert!(
+            !line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        assert_eq!(line.spans[2].content, "removed");
+        assert!(
+            line.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]
