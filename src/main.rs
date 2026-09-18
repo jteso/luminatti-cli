@@ -16,7 +16,7 @@ use crossterm::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
         MouseEventKind,
     },
-    execute,
+    execute, queue,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -49,6 +49,8 @@ use diff_view::{
     rendered_diff_lines, side_line, split_separator_line, unified_lines,
 };
 use settings::ProjectSettings;
+
+const SCROLLBAR_VISIBILITY_DURATION: Duration = Duration::from_secs(3);
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Fast syntax-aware worktree diff review")]
@@ -229,6 +231,7 @@ struct App {
     message: String,
     remote: RemoteStatus,
     last_refresh: Instant,
+    scrollbar_visible_until: Option<Instant>,
 }
 
 impl App {
@@ -271,6 +274,7 @@ impl App {
             message: "watching worktree".into(),
             remote: RemoteStatus::default(),
             last_refresh: Instant::now() - Duration::from_secs(1),
+            scrollbar_visible_until: None,
         };
         app.refresh()?;
         Ok(app)
@@ -303,6 +307,16 @@ impl App {
             self.focus = focus;
         }
     }
+
+    fn reveal_scrollbars(&mut self) {
+        self.scrollbar_visible_until = Some(Instant::now() + SCROLLBAR_VISIBILITY_DURATION);
+    }
+
+    fn scrollbars_visible(&self) -> bool {
+        self.scrollbar_visible_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
     fn all_comments(&self) -> Vec<&ReviewComment> {
         self.local_comments
             .comments
@@ -1190,6 +1204,7 @@ fn draw_files(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         tree_rows.len(),
         area.height.saturating_sub(2) as usize,
         state.offset(),
+        app.scrollbars_visible(),
     );
 }
 
@@ -1242,6 +1257,7 @@ fn draw_filters(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         },
         area.height.saturating_sub(2) as usize,
         state.offset(),
+        app.scrollbars_visible(),
     );
 }
 
@@ -1283,8 +1299,10 @@ fn render_vertical_scrollbar(
     content_length: usize,
     viewport_length: usize,
     offset: usize,
+    visible: bool,
 ) {
-    if content_length <= viewport_length
+    if !visible
+        || content_length <= viewport_length
         || viewport_length == 0
         || area.width == 0
         || area.height <= 2
@@ -1297,7 +1315,7 @@ fn render_vertical_scrollbar(
         .track_symbol(Some("│"))
         .track_style(Style::default().fg(Color::DarkGray))
         .thumb_symbol("┃")
-        .thumb_style(Style::default().fg(Color::Gray));
+        .thumb_style(accent_style());
     let mut state = ScrollbarState::new(content_length)
         .position(scrollbar_position(content_length, viewport_length, offset))
         .viewport_content_length(viewport_length);
@@ -1317,8 +1335,9 @@ fn render_horizontal_scrollbar(
     content_length: usize,
     viewport_length: usize,
     offset: usize,
+    visible: bool,
 ) {
-    if content_length <= viewport_length || viewport_length == 0 || area.width == 0 {
+    if !visible || content_length <= viewport_length || viewport_length == 0 || area.width == 0 {
         return;
     }
     let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
@@ -1465,13 +1484,7 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     .saturating_sub(horizontal_viewport)
                     .min(u16::MAX as usize) as u16,
             );
-            let has_horizontal_scroll = horizontal_content > horizontal_viewport;
-            let content_area = Rect {
-                height: diff_area
-                    .height
-                    .saturating_sub(u16::from(has_horizontal_scroll)),
-                ..diff_area
-            };
+            let content_area = diff_area;
             let padded_width = horizontal_content
                 .max(horizontal_viewport)
                 .min(u16::MAX as usize) as u16;
@@ -1544,13 +1557,7 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     .saturating_sub(horizontal_viewport)
                     .min(u16::MAX as usize) as u16,
             );
-            let has_horizontal_scroll = horizontal_content > horizontal_viewport;
-            let content_area = Rect {
-                height: diff_area
-                    .height
-                    .saturating_sub(u16::from(has_horizontal_scroll)),
-                ..diff_area
-            };
+            let content_area = diff_area;
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -1593,17 +1600,20 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         frame,
         area,
         content_length,
-        diff_area
-            .height
-            .saturating_sub(u16::from(horizontal_content > horizontal_viewport)) as usize,
+        diff_area.height as usize,
         scroll,
+        app.scrollbars_visible(),
     );
     render_horizontal_scrollbar(
         frame,
-        diff_area,
+        area.inner(Margin {
+            vertical: 0,
+            horizontal: 1,
+        }),
         horizontal_content,
         horizontal_viewport,
         horizontal_scroll,
+        app.scrollbars_visible(),
     );
 }
 fn draw_comments(frame: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -1645,6 +1655,7 @@ fn draw_comments(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         comments.len(),
         area.height.saturating_sub(2).saturating_div(3).max(1) as usize,
         state.offset(),
+        app.scrollbars_visible(),
     );
 }
 
@@ -1941,6 +1952,7 @@ fn draw_file_search(frame: &mut ratatui::Frame, app: &App, input: &Input, area: 
         matches.len(),
         sections[1].height as usize,
         state.offset(),
+        app.scrollbars_visible(),
     );
 }
 
@@ -2027,6 +2039,7 @@ fn handle_file_search_key(app: &mut App, code: KeyCode) -> Result<()> {
             }
         }
         KeyCode::Down | KeyCode::Up => {
+            app.reveal_scrollbars();
             let query = app
                 .input
                 .as_ref()
@@ -2171,10 +2184,12 @@ fn handle_key(
             resize_focused_panel(&mut app.divider, app.focus, true, terminal_width)
         }
         KeyCode::Char('[') => {
+            app.reveal_scrollbars();
             let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
             move_change_selection(app, false, viewport)?
         }
         KeyCode::Char(']') => {
+            app.reveal_scrollbars();
             let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
             move_change_selection(app, true, viewport)?
         }
@@ -2229,52 +2244,64 @@ fn handle_key(
             }
         }
         KeyCode::Char('y') if app.right_tab == RightTab::Comments => app.copy_comment()?,
-        KeyCode::Down => match (app.focus, app.right_tab) {
-            (Focus::Files, _) => {
-                let tree_len = app.file_tree_rows().len();
-                move_selection(&mut app.selected_file, tree_len, true)
-            }
-            (Focus::Filters, _) => {
-                if app.filter_tab == FilterTab::Filters {
-                    move_selection(&mut app.selected_filter, app.filters.patterns.len(), true)
-                } else {
-                    move_selection(&mut app.selected_ignored, app.ignored_files.len(), true)
+        KeyCode::Down => {
+            app.reveal_scrollbars();
+            match (app.focus, app.right_tab) {
+                (Focus::Files, _) => {
+                    let tree_len = app.file_tree_rows().len();
+                    move_selection(&mut app.selected_file, tree_len, true)
+                }
+                (Focus::Filters, _) => {
+                    if app.filter_tab == FilterTab::Filters {
+                        move_selection(&mut app.selected_filter, app.filters.patterns.len(), true)
+                    } else {
+                        move_selection(&mut app.selected_ignored, app.ignored_files.len(), true)
+                    }
+                }
+                (Focus::Right, RightTab::Diff) => {
+                    let viewport =
+                        active_diff_viewport_height(app, terminal_width, terminal_height);
+                    move_diff_selection(app, true, viewport);
+                }
+                (Focus::Right, RightTab::Comments) => {
+                    let comment_count =
+                        app.local_comments.comments.len() + app.agent_comments.len();
+                    move_selection(&mut app.selected_comment, comment_count, true)
                 }
             }
-            (Focus::Right, RightTab::Diff) => {
-                let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
-                move_diff_selection(app, true, viewport);
-            }
-            (Focus::Right, RightTab::Comments) => {
-                let comment_count = app.local_comments.comments.len() + app.agent_comments.len();
-                move_selection(&mut app.selected_comment, comment_count, true)
-            }
-        },
-        KeyCode::Up => match (app.focus, app.right_tab) {
-            (Focus::Files, _) => {
-                let tree_len = app.file_tree_rows().len();
-                move_selection(&mut app.selected_file, tree_len, false)
-            }
-            (Focus::Filters, _) => {
-                if app.filter_tab == FilterTab::Filters {
-                    move_selection(&mut app.selected_filter, app.filters.patterns.len(), false)
-                } else {
-                    move_selection(&mut app.selected_ignored, app.ignored_files.len(), false)
+        }
+        KeyCode::Up => {
+            app.reveal_scrollbars();
+            match (app.focus, app.right_tab) {
+                (Focus::Files, _) => {
+                    let tree_len = app.file_tree_rows().len();
+                    move_selection(&mut app.selected_file, tree_len, false)
+                }
+                (Focus::Filters, _) => {
+                    if app.filter_tab == FilterTab::Filters {
+                        move_selection(&mut app.selected_filter, app.filters.patterns.len(), false)
+                    } else {
+                        move_selection(&mut app.selected_ignored, app.ignored_files.len(), false)
+                    }
+                }
+                (Focus::Right, RightTab::Diff) => {
+                    let viewport =
+                        active_diff_viewport_height(app, terminal_width, terminal_height);
+                    move_diff_selection(app, false, viewport);
+                }
+                (Focus::Right, RightTab::Comments) => {
+                    let comment_count =
+                        app.local_comments.comments.len() + app.agent_comments.len();
+                    move_selection(&mut app.selected_comment, comment_count, false)
                 }
             }
-            (Focus::Right, RightTab::Diff) => {
-                let viewport = active_diff_viewport_height(app, terminal_width, terminal_height);
-                move_diff_selection(app, false, viewport);
-            }
-            (Focus::Right, RightTab::Comments) => {
-                let comment_count = app.local_comments.comments.len() + app.agent_comments.len();
-                move_selection(&mut app.selected_comment, comment_count, false)
-            }
-        },
+        }
         KeyCode::Left if app.focus == Focus::Right && app.right_tab == RightTab::Diff => {
+            app.reveal_scrollbars();
             move_diff_horizontally(app, false, terminal_width)
         }
         KeyCode::Right if app.focus == Focus::Right && app.right_tab == RightTab::Diff => {
+            app.reveal_scrollbars();
             move_diff_horizontally(app, true, terminal_width)
         }
         KeyCode::Enter if app.focus == Focus::Files => {
@@ -2297,6 +2324,15 @@ fn handle_mouse(
 ) -> Result<()> {
     if app.show_help || app.input.is_some() || app.confirmation.is_some() {
         return Ok(());
+    }
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    ) {
+        app.reveal_scrollbars();
     }
     if let Some(panel) = app.maximized_panel {
         return handle_maximized_mouse(app, panel, mouse, terminal_width, terminal_height);
@@ -2491,7 +2527,7 @@ fn handle_maximized_mouse(
 fn run_tui(mut app: App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    queue!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = (|| -> Result<()> {
@@ -2593,6 +2629,7 @@ mod tests {
             message: String::new(),
             remote: RemoteStatus::default(),
             last_refresh: Instant::now(),
+            scrollbar_visible_until: None,
         }
     }
 
@@ -3012,6 +3049,7 @@ mod tests {
         assert_eq!(app.diff_horizontal_scroll, 0);
 
         app.diff_horizontal_scroll = 6;
+        app.reveal_scrollbars();
         let mut terminal = Terminal::new(TestBackend::new(50, 8)).unwrap();
         terminal
             .draw(|frame| draw_diff(frame, &app, frame.area()))
@@ -3020,7 +3058,8 @@ mod tests {
 
         assert_eq!(buffer[(1, 1)].symbol(), "s");
         assert_eq!(buffer[(26, 1)].symbol(), "s");
-        assert!((1..49).any(|x| buffer[(x, 6)].symbol() == "━"));
+        assert!((1..49).any(|x| buffer[(x, 7)].symbol() == "━"));
+        assert_eq!(buffer[(49, 1)].fg, Color::Magenta);
     }
 
     #[test]
@@ -3028,6 +3067,18 @@ mod tests {
         assert_eq!(scrollbar_position(10, 4, 0), 0);
         assert_eq!(scrollbar_position(10, 4, 6), 9);
         assert_eq!(scrollbar_position(4, 4, 0), 0);
+    }
+
+    #[test]
+    fn scrollbars_are_hidden_until_scroll_activity_then_expire() {
+        let mut app = preview_app("before\n", "after\n");
+
+        assert!(!app.scrollbars_visible());
+        app.reveal_scrollbars();
+        assert!(app.scrollbars_visible());
+
+        app.scrollbar_visible_until = Some(Instant::now() - Duration::from_millis(1));
+        assert!(!app.scrollbars_visible());
     }
 
     #[test]
