@@ -2,31 +2,107 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::diff::{DiffRow, DiffSpan, StructuralChange, visible_diff_indices};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const SPLIT_CONTEXT_LINES: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum DiffMode {
     SideBySide,
     Unified,
 }
 
-pub(crate) fn rendered_diff_indices(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderedDiffLine {
+    Row(usize),
+    Separator,
+}
+
+impl RenderedDiffLine {
+    pub(crate) fn row_index(self) -> Option<usize> {
+        match self {
+            Self::Row(index) => Some(index),
+            Self::Separator => None,
+        }
+    }
+}
+
+pub(crate) fn displayed_diff_indices(
     rows: &[DiffRow],
     show_unchanged: bool,
     mode: DiffMode,
 ) -> Vec<usize> {
+    rendered_diff_lines(rows, show_unchanged, mode)
+        .into_iter()
+        .filter_map(RenderedDiffLine::row_index)
+        .fold(Vec::new(), |mut indices, index| {
+            if indices.last() != Some(&index) {
+                indices.push(index);
+            }
+            indices
+        })
+}
+
+pub(crate) fn rendered_diff_lines(
+    rows: &[DiffRow],
+    show_unchanged: bool,
+    mode: DiffMode,
+) -> Vec<RenderedDiffLine> {
+    if mode == DiffMode::SideBySide {
+        return split_hunk_lines(rows, show_unchanged);
+    }
+
     visible_diff_indices(rows, show_unchanged)
         .into_iter()
         .flat_map(|index| {
-            let line_count = if mode == DiffMode::Unified {
-                unified_lines(index, &rows[index], usize::MAX).len()
-            } else {
-                1
-            };
-            std::iter::repeat_n(index, line_count)
+            std::iter::repeat_n(
+                RenderedDiffLine::Row(index),
+                unified_lines(index, &rows[index], usize::MAX).len(),
+            )
         })
         .collect()
+}
+
+fn split_hunk_lines(rows: &[DiffRow], show_unchanged: bool) -> Vec<RenderedDiffLine> {
+    if show_unchanged {
+        return (0..rows.len()).map(RenderedDiffLine::Row).collect();
+    }
+
+    let mut ranges: Vec<(usize, usize)> = vec![];
+    for changed in visible_diff_indices(rows, false) {
+        let start = changed.saturating_sub(SPLIT_CONTEXT_LINES);
+        let end = changed
+            .saturating_add(SPLIT_CONTEXT_LINES + 1)
+            .min(rows.len());
+        if let Some((_, previous_end)) = ranges.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            ranges.push((start, end));
+        }
+    }
+
+    let mut rendered = vec![];
+    for (range_index, (start, end)) in ranges.into_iter().enumerate() {
+        if range_index > 0 {
+            rendered.push(RenderedDiffLine::Separator);
+        }
+        rendered.extend((start..end).map(RenderedDiffLine::Row));
+    }
+    rendered
+}
+
+pub(crate) fn split_separator_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "  ···",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    ))
 }
 
 pub(crate) fn side_line(
@@ -40,13 +116,16 @@ pub(crate) fn side_line(
 ) -> Line<'static> {
     let prefix = line
         .map(|n| format!("{:>5} ", n))
-        .unwrap_or_else(|| "      ".into());
+        .unwrap_or_else(|| "    · ".into());
     let selected = index == selected && line.is_some();
-    let prefix_style = selected_style(changed_style(changed, deletion), selected);
-    let mut rendered = vec![Span::styled(
-        prefix,
-        prefix_style.add_modifier(Modifier::DIM),
-    )];
+    let prefix_style = if line.is_none() {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    } else {
+        selected_style(changed_style(changed, deletion), selected).add_modifier(Modifier::DIM)
+    };
+    let mut rendered = vec![Span::styled(prefix, prefix_style)];
     rendered.extend(styled_source_spans(
         text, spans, changed, deletion, selected,
     ));
@@ -187,11 +266,14 @@ fn selected_style(style: Style, selected: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::StructuralHighlight;
+    use crate::diff::{StructuralHighlight, line_diff_document};
 
     #[test]
     fn missing_split_side_is_not_selected() {
         let missing = side_line(0, None, "", &[], false, true, 0);
+        assert_eq!(missing.spans[0].content, "    · ");
+        assert_eq!(missing.spans[0].style.fg, Some(Color::DarkGray));
+        assert!(missing.spans[0].style.add_modifier.contains(Modifier::DIM));
         assert!(
             missing
                 .spans
@@ -229,5 +311,39 @@ mod tests {
         assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
         assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(line.spans.last().unwrap().style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn split_view_groups_distant_changes_into_contextual_hunks() {
+        let before = (1..=24)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after = before
+            .replace("line 5", "changed 5")
+            .replace("line 20", "changed 20");
+        let rows = line_diff_document(&before, &after).rows;
+
+        let rendered = rendered_diff_lines(&rows, false, DiffMode::SideBySide);
+        assert_eq!(
+            rendered,
+            vec![
+                RenderedDiffLine::Row(1),
+                RenderedDiffLine::Row(2),
+                RenderedDiffLine::Row(3),
+                RenderedDiffLine::Row(4),
+                RenderedDiffLine::Row(5),
+                RenderedDiffLine::Row(6),
+                RenderedDiffLine::Row(7),
+                RenderedDiffLine::Separator,
+                RenderedDiffLine::Row(16),
+                RenderedDiffLine::Row(17),
+                RenderedDiffLine::Row(18),
+                RenderedDiffLine::Row(19),
+                RenderedDiffLine::Row(20),
+                RenderedDiffLine::Row(21),
+                RenderedDiffLine::Row(22),
+            ]
+        );
     }
 }

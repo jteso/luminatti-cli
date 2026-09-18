@@ -1,14 +1,16 @@
 # Luminatti
 
 Luminatti is a compact, keyboard-first Git worktree diff TUI with mouse support,
-resizable panes, Difftastic-powered structural split and unified diffs, local
-review notes, and agent-readable comments.
+resizable panes, line-aligned split diffs, Difftastic-powered structural unified
+diffs, local review notes, and agent-readable comments.
 
 Difftastic and its Tree-sitter parsers are embedded in the binary. No separate
-`difft` installation is required. Luminatti preserves Difftastic's structural
+`difft` installation is required. Unified view preserves Difftastic's structural
 line alignment and token-level change emphasis while using a neutral source
-palette. It also preserves Difftastic's native line-oriented fallbacks for
-unsupported or unparsable inputs.
+palette. Split view uses predictable physical-line alignment with word-level
+change emphasis, three lines of surrounding context, and collapsed-gap hunk
+separators. Difftastic's native line-oriented fallbacks remain available for
+unsupported or unparsable inputs in unified view.
 
 ```sh
 cargo run --release --bin luminatti -- .
@@ -52,13 +54,16 @@ by the configured filter globs.
 
 ## Metadata and agents
 
-All metadata stays in `.luminatti/`; Luminatti does not manage `.gitignore`.
+All metadata stays in `.luminatti/`; Luminatti does not manage `.gitignore` and
+does not show its own metadata in the review tree.
 
 - `.luminatti/comments.json` contains human comments created in the TUI.
 - `.luminatti/agent-comments.json` is watched read-only and accepts a
   Hunk-compatible JSON batch: `{ "comments": [{ "filePath": "src/a.rs",
   "newLine": 12, "summary": "...", "rationale": "...", "author": "agent" }] }`.
 - `.luminatti/filters.json` contains project-local glob exclusions.
+- `.luminatti/settings.json` remembers project-local viewing preferences such
+  as unified/split mode, common-line visibility, and divider width.
 
 Agent comments and local notes are anchored to file paths and old/new lines;
 they never modify code.

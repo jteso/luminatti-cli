@@ -2,6 +2,7 @@ use std::path::Path;
 
 pub(crate) use difftastic::{StructuralChange, StructuralHighlight};
 use difftastic::{StructuralSpan, structural_diff};
+use similar::{ChangeTag, TextDiff};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DiffDocument {
@@ -36,7 +37,11 @@ impl DiffRow {
     }
 }
 
-pub(crate) fn diff_document(display_path: &Path, before: &str, after: &str) -> DiffDocument {
+pub(crate) fn structural_diff_document(
+    display_path: &Path,
+    before: &str,
+    after: &str,
+) -> DiffDocument {
     let structural = structural_diff(display_path, before, after);
     let old_lines = source_lines(before);
     let new_lines = source_lines(after);
@@ -78,6 +83,185 @@ pub(crate) fn diff_document(display_path: &Path, before: &str, after: &str) -> D
         language: structural.language,
         has_syntactic_changes: structural.has_syntactic_changes,
         rows,
+    }
+}
+
+pub(crate) fn line_diff_document(before: &str, after: &str) -> DiffDocument {
+    let diff = TextDiff::from_lines(before, after);
+    let mut rows = vec![];
+    let mut old_line = 0u32;
+    let mut new_line = 0u32;
+    let mut deleted = vec![];
+    let mut inserted = vec![];
+
+    for change in diff.iter_all_changes() {
+        let text = source_line(change.value()).to_owned();
+        match change.tag() {
+            ChangeTag::Delete => {
+                old_line += 1;
+                deleted.push((old_line, text));
+            }
+            ChangeTag::Insert => {
+                new_line += 1;
+                inserted.push((new_line, text));
+            }
+            ChangeTag::Equal => {
+                flush_line_changes(&mut rows, &mut deleted, &mut inserted);
+                old_line += 1;
+                new_line += 1;
+                rows.push(DiffRow {
+                    old_line: Some(old_line),
+                    new_line: Some(new_line),
+                    old_text: text.clone(),
+                    new_text: text.clone(),
+                    old_changed: false,
+                    new_changed: false,
+                    old_spans: whole_line_span(&text, StructuralChange::Unchanged),
+                    new_spans: whole_line_span(&text, StructuralChange::Unchanged),
+                });
+            }
+        }
+    }
+    flush_line_changes(&mut rows, &mut deleted, &mut inserted);
+
+    DiffDocument {
+        language: String::new(),
+        has_syntactic_changes: rows.iter().any(DiffRow::is_changed),
+        rows,
+    }
+}
+
+fn source_line(value: &str) -> &str {
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    value.strip_suffix('\r').unwrap_or(value)
+}
+
+fn flush_line_changes(
+    rows: &mut Vec<DiffRow>,
+    deleted: &mut Vec<(u32, String)>,
+    inserted: &mut Vec<(u32, String)>,
+) {
+    let changed_count = deleted.len().max(inserted.len());
+    for index in 0..changed_count {
+        let old = deleted.get(index);
+        let new = inserted.get(index);
+        let (old_spans, new_spans) = match (old, new) {
+            (Some((_, old_text)), Some((_, new_text))) => word_diff_spans(old_text, new_text),
+            (Some((_, old_text)), None) => {
+                (whole_line_span(old_text, StructuralChange::Novel), vec![])
+            }
+            (None, Some((_, new_text))) => {
+                (vec![], whole_line_span(new_text, StructuralChange::Novel))
+            }
+            (None, None) => unreachable!("change block contains at least one line"),
+        };
+        rows.push(DiffRow {
+            old_line: old.map(|(line, _)| *line),
+            new_line: new.map(|(line, _)| *line),
+            old_text: old.map(|(_, text)| text.clone()).unwrap_or_default(),
+            new_text: new.map(|(_, text)| text.clone()).unwrap_or_default(),
+            old_changed: old.is_some(),
+            new_changed: new.is_some(),
+            old_spans,
+            new_spans,
+        });
+    }
+    deleted.clear();
+    inserted.clear();
+}
+
+fn word_diff_spans(old: &str, new: &str) -> (Vec<DiffSpan>, Vec<DiffSpan>) {
+    let old_tokens = lexical_tokens(old);
+    let new_tokens = lexical_tokens(new);
+    let diff = TextDiff::from_slices(&old_tokens, &new_tokens);
+    let mut old_spans = vec![];
+    let mut new_spans = vec![];
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+
+    for change in diff.iter_all_changes() {
+        let length = change.value().len();
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_spans.push(diff_span(
+                    old_cursor,
+                    old_cursor + length,
+                    StructuralChange::Unchanged,
+                ));
+                new_spans.push(diff_span(
+                    new_cursor,
+                    new_cursor + length,
+                    StructuralChange::Unchanged,
+                ));
+                old_cursor += length;
+                new_cursor += length;
+            }
+            ChangeTag::Delete => {
+                old_spans.push(diff_span(
+                    old_cursor,
+                    old_cursor + length,
+                    StructuralChange::NovelWord,
+                ));
+                old_cursor += length;
+            }
+            ChangeTag::Insert => {
+                new_spans.push(diff_span(
+                    new_cursor,
+                    new_cursor + length,
+                    StructuralChange::NovelWord,
+                ));
+                new_cursor += length;
+            }
+        }
+    }
+    (old_spans, new_spans)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenClass {
+    Word,
+    Whitespace,
+    Punctuation,
+}
+
+fn lexical_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = vec![];
+    let mut start = 0;
+    let mut current = None;
+
+    for (index, character) in text.char_indices() {
+        let class = if character.is_alphanumeric() || character == '_' {
+            TokenClass::Word
+        } else if character.is_whitespace() {
+            TokenClass::Whitespace
+        } else {
+            TokenClass::Punctuation
+        };
+        if current.is_some_and(|current| current != class) {
+            tokens.push(&text[start..index]);
+            start = index;
+        }
+        current = Some(class);
+    }
+    if start < text.len() {
+        tokens.push(&text[start..]);
+    }
+    tokens
+}
+
+fn whole_line_span(text: &str, change: StructuralChange) -> Vec<DiffSpan> {
+    (!text.is_empty())
+        .then(|| diff_span(0, text.len(), change))
+        .into_iter()
+        .collect()
+}
+
+fn diff_span(start: usize, end: usize, change: StructuralChange) -> DiffSpan {
+    DiffSpan {
+        start,
+        end,
+        change,
+        highlight: StructuralHighlight::Normal,
     }
 }
 
@@ -144,7 +328,7 @@ mod tests {
 
     #[test]
     fn typescript_diff_preserves_token_level_changes() {
-        let document = diff_document(
+        let document = structural_diff_document(
             Path::new("employee.ts"),
             "const employee = oldEmployee;\n",
             "const employee = newEmployee;\n",
@@ -167,7 +351,7 @@ mod tests {
 
     #[test]
     fn structural_alignment_keeps_added_object_fields_on_the_new_side() {
-        let document = diff_document(
+        let document = structural_diff_document(
             Path::new("employee.ts"),
             "const value = {\n  name: employee.name,\n};\n",
             "const value = {\n  name: employee.name,\n  city: employee.city,\n};\n",
@@ -185,7 +369,7 @@ mod tests {
 
     #[test]
     fn multiline_signature_and_expression_edits_keep_structural_correspondence() {
-        let document = diff_document(
+        let document = structural_diff_document(
             Path::new("payroll.ts"),
             "export function mapEmployee(employee: PreparedEmployee): PayrollEmployee {\n  const values = {\n    employeeCountry: resolve(employee.values.employeeCountry),\n  };\n}\n",
             "export function mapEmployee(\n  employee: PreparedEmployee,\n  enrichment: PayrollEnrichment = {},\n): PayrollEmployee {\n  const merged = { ...employee.values, ...enrichment };\n  const values = {\n    employeeCountry: resolve(merged.employeeCountry),\n  };\n}\n",
@@ -218,14 +402,15 @@ mod tests {
 
     #[test]
     fn unchanged_rows_can_be_included_or_hidden() {
-        let rows = diff_document(Path::new("example.rs"), "same\nold\n", "same\nnew\n").rows;
+        let rows =
+            structural_diff_document(Path::new("example.rs"), "same\nold\n", "same\nnew\n").rows;
         assert_eq!(visible_diff_indices(&rows, false), vec![1]);
         assert_eq!(visible_diff_indices(&rows, true), vec![0, 1]);
     }
 
     #[test]
     fn changed_row_navigation_includes_adjacent_changes() {
-        let rows = diff_document(
+        let rows = structural_diff_document(
             Path::new("example.txt"),
             "same\nold one\nold two\nbetween\nold three\nend\n",
             "same\nnew one\nnew two\nbetween\nnew three\nend\n",
@@ -242,5 +427,39 @@ mod tests {
             adjacent_changed_row(&rows, changed[1], false),
             Some(changed[0])
         );
+    }
+
+    #[test]
+    fn line_diff_pairs_physical_lines_and_marks_changed_words() {
+        let document = line_diff_document(
+            "const employee = oldEmployee;\nunchanged\n",
+            "const employee = newEmployee;\nunchanged\n",
+        );
+
+        assert_eq!(document.rows.len(), 2);
+        let changed = &document.rows[0];
+        assert_eq!((changed.old_line, changed.new_line), (Some(1), Some(1)));
+        assert_eq!(
+            changed_text(&changed.old_text, &changed.old_spans),
+            vec!["oldEmployee"]
+        );
+        assert_eq!(
+            changed_text(&changed.new_text, &changed.new_spans),
+            vec!["newEmployee"]
+        );
+    }
+
+    #[test]
+    fn line_diff_keeps_extra_insertions_on_the_new_side() {
+        let document = line_diff_document("first\nlast\n", "first\nadded\nlast\n");
+        let added = document
+            .rows
+            .iter()
+            .find(|row| row.new_text == "added")
+            .unwrap();
+
+        assert_eq!(added.old_line, None);
+        assert_eq!(added.new_line, Some(2));
+        assert!(added.new_changed);
     }
 }

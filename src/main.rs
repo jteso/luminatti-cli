@@ -36,11 +36,19 @@ use uuid::Uuid;
 
 mod diff;
 mod diff_view;
+mod settings;
 
+#[cfg(test)]
+use diff::visible_diff_indices;
 use diff::{
-    DiffRow, adjacent_changed_row, changed_row_indices, diff_document, visible_diff_indices,
+    DiffRow, adjacent_changed_row, changed_row_indices, line_diff_document,
+    structural_diff_document,
 };
-use diff_view::{DiffMode, rendered_diff_indices, side_line, unified_lines};
+use diff_view::{
+    DiffMode, RenderedDiffLine, displayed_diff_indices, rendered_diff_lines, side_line,
+    split_separator_line, unified_lines,
+};
+use settings::ProjectSettings;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Fast syntax-aware worktree diff review")]
@@ -221,6 +229,8 @@ struct App {
 
 impl App {
     fn new(repo: PathBuf) -> Result<Self> {
+        let settings: ProjectSettings =
+            read_json(&repo.join(".luminatti/settings.json")).unwrap_or_default();
         let mut app = Self {
             repo,
             files: vec![],
@@ -232,15 +242,15 @@ impl App {
             filter_tab: FilterTab::Filters,
             focus: Focus::Files,
             maximized_panel: None,
-            diff_mode: DiffMode::SideBySide,
-            show_unchanged: false,
+            diff_mode: settings.diff_mode,
+            show_unchanged: settings.show_unchanged,
             selected_file: 0,
             selected_filter: 0,
             selected_ignored: 0,
             selected_comment: 0,
             selected_row: 0,
             collapsed_dirs: BTreeSet::new(),
-            divider: 34,
+            divider: settings.divider,
             dragging_divider: false,
             diff_rows: vec![],
             diff_language: String::new(),
@@ -269,6 +279,9 @@ impl App {
     }
     fn agent_comments_path(&self) -> PathBuf {
         self.metadata_dir().join("agent-comments.json")
+    }
+    fn settings_path(&self) -> PathBuf {
+        self.metadata_dir().join("settings.json")
     }
     fn active_path(&self) -> Option<&str> {
         self.active_file_index()
@@ -398,7 +411,10 @@ impl App {
         }
         self.diff_rows.clear();
         self.diff_scroll = 0;
-        let document = diff_document(Path::new(&path), &before, &after);
+        let document = match self.diff_mode {
+            DiffMode::SideBySide => line_diff_document(&before, &after),
+            DiffMode::Unified => structural_diff_document(Path::new(&path), &before, &after),
+        };
         self.diff_rows = document.rows;
         self.diff_language = document.language;
         self.diff_has_syntactic_changes = document.has_syntactic_changes;
@@ -411,11 +427,53 @@ impl App {
         Ok(())
     }
 
+    fn set_diff_mode(&mut self, mode: DiffMode) -> Result<()> {
+        if self.diff_mode == mode {
+            return Ok(());
+        }
+        let anchor = self
+            .diff_rows
+            .get(self.selected_row)
+            .map(|row| (row.old_line, row.new_line));
+        self.diff_mode = mode;
+        self.diff_signature = None;
+        self.rebuild_diff()?;
+        if let Some((old_line, new_line)) = anchor {
+            self.selected_row = self
+                .diff_rows
+                .iter()
+                .position(|row| row.old_line == old_line && row.new_line == new_line)
+                .or_else(|| {
+                    new_line.and_then(|line| {
+                        self.diff_rows
+                            .iter()
+                            .position(|row| row.new_line == Some(line))
+                    })
+                })
+                .or_else(|| {
+                    old_line.and_then(|line| {
+                        self.diff_rows
+                            .iter()
+                            .position(|row| row.old_line == Some(line))
+                    })
+                })
+                .unwrap_or(self.selected_row);
+        }
+        self.diff_scroll = 0;
+        Ok(())
+    }
+
     fn save_filters(&self) -> Result<()> {
         save_json(&self.filters_path(), &self.filters)
     }
     fn save_comments(&self) -> Result<()> {
         save_json(&self.local_comments_path(), &self.local_comments)
+    }
+    fn save_settings(&self) -> Result<()> {
+        save_json(
+            &self.settings_path(),
+            &ProjectSettings::new(self.diff_mode, self.show_unchanged, self.divider),
+        )
     }
 
     fn add_comment(&mut self, summary: String) -> Result<()> {
@@ -562,7 +620,7 @@ fn diff_viewport_height(terminal_height: u16) -> u16 {
 }
 
 fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
-    let visible = visible_diff_indices(&app.diff_rows, app.show_unchanged);
+    let visible = displayed_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
     if visible.is_empty() {
         return;
     }
@@ -580,14 +638,14 @@ fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
 }
 
 fn scroll_diff_selection_into_view(app: &mut App, viewport_height: u16) {
-    let rendered = rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+    let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
     let rendered_start = rendered
         .iter()
-        .position(|index| *index == app.selected_row)
+        .position(|line| line.row_index() == Some(app.selected_row))
         .unwrap_or(0);
     let rendered_end = rendered
         .iter()
-        .rposition(|index| *index == app.selected_row)
+        .rposition(|line| line.row_index() == Some(app.selected_row))
         .unwrap_or(rendered_start);
     let mut scroll = clamped_diff_scroll(app.diff_scroll, rendered.len(), viewport_height) as usize;
     if rendered_start < scroll {
@@ -649,12 +707,8 @@ fn move_file_selection(app: &mut App, forward: bool) -> Result<()> {
 
 fn toggle_unchanged(app: &mut App) {
     app.show_unchanged = !app.show_unchanged;
-    if !app.show_unchanged
-        && app
-            .diff_rows
-            .get(app.selected_row)
-            .is_some_and(|row| !row.is_changed())
-    {
+    let displayed = displayed_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+    if !app.show_unchanged && !displayed.contains(&app.selected_row) {
         app.selected_row = app
             .diff_rows
             .iter()
@@ -748,7 +802,7 @@ fn changed_files(repo: &Path) -> Result<Vec<FileItem>> {
         }
         let status = String::from_utf8_lossy(&entry[..2]).to_string();
         let path = String::from_utf8_lossy(&entry[3..]).to_string();
-        if seen.insert(path.clone()) {
+        if !is_luminatti_metadata(&path) && seen.insert(path.clone()) {
             files.push(FileItem { path, status });
         }
         // A renamed/copied porcelain v1 record has a second NUL-delimited
@@ -760,6 +814,9 @@ fn changed_files(repo: &Path) -> Result<Vec<FileItem>> {
         };
     }
     Ok(files)
+}
+fn is_luminatti_metadata(path: &str) -> bool {
+    path == ".luminatti" || path.starts_with(".luminatti/")
 }
 fn git_show_head_file(repo: &Path, path: &str) -> Result<String> {
     let spec = format!("HEAD:{path}");
@@ -1134,7 +1191,7 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let diff_area = inner;
-    let visible = visible_diff_indices(&app.diff_rows, app.show_unchanged);
+    let visible = displayed_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
     if visible.is_empty() {
         let message = if !app.diff_has_syntactic_changes && !app.diff_language.is_empty() {
             format!("No syntactic changes ({})", app.diff_language)
@@ -1157,41 +1214,48 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), diff_area);
         (content_length, scroll as usize)
     } else {
+        let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(diff_area);
-        let old: Vec<_> = visible
+        let old: Vec<_> = rendered
             .iter()
-            .map(|index| {
-                let row = &app.diff_rows[*index];
-                side_line(
-                    *index,
-                    row.old_line,
-                    &row.old_text,
-                    &row.old_spans,
-                    row.old_changed,
-                    true,
-                    app.selected_row,
-                )
+            .map(|line| match line {
+                RenderedDiffLine::Row(index) => {
+                    let row = &app.diff_rows[*index];
+                    side_line(
+                        *index,
+                        row.old_line,
+                        &row.old_text,
+                        &row.old_spans,
+                        row.old_changed,
+                        true,
+                        app.selected_row,
+                    )
+                }
+                RenderedDiffLine::Separator => split_separator_line(),
             })
             .collect();
-        let new: Vec<_> = visible
+        let new: Vec<_> = rendered
             .iter()
-            .map(|index| {
-                let row = &app.diff_rows[*index];
-                side_line(
-                    *index,
-                    row.new_line,
-                    &row.new_text,
-                    &row.new_spans,
-                    row.new_changed,
-                    false,
-                    app.selected_row,
-                )
+            .map(|line| match line {
+                RenderedDiffLine::Row(index) => {
+                    let row = &app.diff_rows[*index];
+                    side_line(
+                        *index,
+                        row.new_line,
+                        &row.new_text,
+                        &row.new_spans,
+                        row.new_changed,
+                        false,
+                        app.selected_row,
+                    )
+                }
+                RenderedDiffLine::Separator => split_separator_line(),
             })
             .collect();
-        let scroll = clamped_diff_scroll(app.diff_scroll, visible.len(), diff_area.height);
+        let scroll = clamped_diff_scroll(app.diff_scroll, rendered.len(), diff_area.height);
         frame.render_widget(Paragraph::new(old).scroll((scroll, 0)), columns[0]);
         frame.render_widget(
             Paragraph::new(new).scroll((scroll, 0)).block(
@@ -1201,7 +1265,7 @@ fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             ),
             columns[1],
         );
-        (visible.len(), scroll as usize)
+        (rendered.len(), scroll as usize)
     };
     render_vertical_scrollbar(
         frame,
@@ -1843,12 +1907,10 @@ fn handle_key(
             app.confirmation = Some(ConfirmationKind::DeleteAllComments);
         }
         KeyCode::Char('u') => {
-            app.diff_mode = DiffMode::Unified;
-            app.diff_scroll = 0;
+            app.set_diff_mode(DiffMode::Unified)?;
         }
         KeyCode::Char('s') => {
-            app.diff_mode = DiffMode::SideBySide;
-            app.diff_scroll = 0;
+            app.set_diff_mode(DiffMode::SideBySide)?;
         }
         KeyCode::Char('i') if app.right_tab == RightTab::Diff => toggle_unchanged(app),
         KeyCode::Char('r') => {
@@ -2006,15 +2068,15 @@ fn handle_mouse(
                 app.focus_panel(Focus::Right);
                 if app.right_tab == RightTab::Diff {
                     let rendered =
-                        rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+                        rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
                     let scroll = clamped_diff_scroll(
                         app.diff_scroll,
                         rendered.len(),
                         diff_viewport_height(terminal_height),
                     );
                     let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
-                    if let Some(index) = rendered.get(position) {
-                        app.selected_row = *index;
+                    if let Some(index) = rendered.get(position).and_then(|line| line.row_index()) {
+                        app.selected_row = index;
                     }
                 } else {
                     let index = mouse.row.saturating_sub(1) as usize;
@@ -2025,7 +2087,7 @@ fn handle_mouse(
         MouseEventKind::ScrollDown
             if app.right_tab == RightTab::Diff && mouse.column >= divider =>
         {
-            let rendered = rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+            let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
             app.diff_scroll = clamped_diff_scroll(
                 app.diff_scroll.saturating_add(3),
                 rendered.len(),
@@ -2084,15 +2146,15 @@ fn handle_maximized_mouse(
             }
             Focus::Right if app.right_tab == RightTab::Diff => {
                 let rendered =
-                    rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+                    rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
                 let scroll = clamped_diff_scroll(
                     app.diff_scroll,
                     rendered.len(),
                     diff_viewport_height(terminal_height),
                 );
                 let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
-                if let Some(index) = rendered.get(position) {
-                    app.selected_row = *index;
+                if let Some(index) = rendered.get(position).and_then(|line| line.row_index()) {
+                    app.selected_row = index;
                 }
             }
             Focus::Right => {
@@ -2102,7 +2164,7 @@ fn handle_maximized_mouse(
             Focus::Files => {}
         },
         MouseEventKind::ScrollDown if panel == Focus::Right && app.right_tab == RightTab::Diff => {
-            let rendered = rendered_diff_indices(&app.diff_rows, app.show_unchanged, app.diff_mode);
+            let rendered = rendered_diff_lines(&app.diff_rows, app.show_unchanged, app.diff_mode);
             app.diff_scroll = clamped_diff_scroll(
                 app.diff_scroll.saturating_add(3),
                 rendered.len(),
@@ -2151,6 +2213,11 @@ fn run_tui(mut app: App) -> Result<()> {
         }
         Ok(())
     })();
+    let settings_result = if result.is_ok() {
+        app.save_settings()
+    } else {
+        Ok(())
+    };
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -2158,7 +2225,8 @@ fn run_tui(mut app: App) -> Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    result
+    result?;
+    settings_result
 }
 
 fn main() -> Result<()> {
@@ -2176,7 +2244,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn test_diff_rows(before: &str, after: &str) -> Vec<DiffRow> {
-        diff_document(Path::new("example.txt"), before, after).rows
+        structural_diff_document(Path::new("example.txt"), before, after).rows
     }
 
     #[test]
@@ -2392,6 +2460,14 @@ mod tests {
     }
 
     #[test]
+    fn luminatti_metadata_is_not_shown_as_a_reviewable_change() {
+        assert!(is_luminatti_metadata(".luminatti/settings.json"));
+        assert!(is_luminatti_metadata(".luminatti/comments.json"));
+        assert!(!is_luminatti_metadata("src/.luminatti/settings.json"));
+        assert!(!is_luminatti_metadata(".luminatti-example"));
+    }
+
+    #[test]
     fn fuzzy_file_search_matches_subsequences_and_keeps_default_order() {
         let files = vec![
             FileItem {
@@ -2509,8 +2585,8 @@ mod tests {
         assert_eq!(visible_diff_indices(&rows, false), vec![1]);
         assert_eq!(visible_diff_indices(&rows, true), vec![0, 1]);
         assert_eq!(
-            rendered_diff_indices(&rows, false, DiffMode::Unified),
-            vec![1, 1]
+            rendered_diff_lines(&rows, false, DiffMode::Unified),
+            vec![RenderedDiffLine::Row(1), RenderedDiffLine::Row(1)]
         );
     }
 
