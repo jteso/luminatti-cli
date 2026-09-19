@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Local application state
+.luminatti/
+
 # Local environment and secrets
 .env
 .env.*
