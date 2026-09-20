@@ -10,6 +10,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 bin_dir=${BIN_DIR:-"${PREFIX:-"$HOME/.local"}/bin"}
 binary_name=luminatti
+target_dir="$script_dir/target"
 
 if ! command -v cargo >/dev/null 2>&1; then
     printf '%s\n' "error: Cargo is required to build Luminatti. Install Rust from https://rustup.rs/." >&2
@@ -17,14 +18,20 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 printf '%s\n' "Building optimized $binary_name..."
-cargo build --release --manifest-path "$script_dir/Cargo.toml" --bin "$binary_name"
+cd "$script_dir"
+cargo build \
+    --release \
+    --locked \
+    --target-dir "$target_dir" \
+    --manifest-path "$script_dir/Cargo.toml" \
+    --bin "$binary_name"
 
 if ! mkdir -p "$bin_dir" 2>/dev/null; then
     printf '%s\n' "error: cannot create $bin_dir. Choose a writable location with BIN_DIR=..." >&2
     exit 1
 fi
 
-install -m 755 "$script_dir/target/release/$binary_name" "$bin_dir/$binary_name"
+install -m 755 "$target_dir/release/$binary_name" "$bin_dir/$binary_name"
 printf '%s\n' "Installed $binary_name to $bin_dir/$binary_name"
 
 case ":${PATH}:" in

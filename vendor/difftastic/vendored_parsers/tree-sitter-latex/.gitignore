@@ -523,3 +523,9 @@ build/
 
 src/parser.c
 src/tree_sitter/
+
+# Difftastic compiles these generated sources directly. Keep the vendored
+# checkout buildable without requiring tree-sitter-cli at install time.
+!src/parser.c
+!src/tree_sitter/
+!src/tree_sitter/parser.h

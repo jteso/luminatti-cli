@@ -102,6 +102,7 @@ in-memory backend and the fixtures in `src/app/test_support.rs`.
 Run the application checks with:
 
 ```sh
+./tests/vendored_parser_sources.sh
 cargo fmt --check
 cargo test --bin luminatti --locked
 cargo clippy --bin luminatti --all-targets --no-deps --locked -- -D warnings

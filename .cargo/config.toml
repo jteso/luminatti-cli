@@ -1,4 +1,4 @@
 [env]
 # difftastic upstream is a binary crate and uses this compile-time variable in
 # CLI help text. Its embedded library target still compiles that code path.
-CARGO_BIN_NAME = "difft"
+CARGO_BIN_NAME = { value = "difft", force = true }
