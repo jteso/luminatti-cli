@@ -16,9 +16,39 @@ pub(super) fn run_tui(mut app: App) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = (|| -> Result<()> {
+        let mut redraw = true;
+        let mut scrollbars_visible = app.scrollbars_visible();
         loop {
-            terminal.draw(|frame| draw(frame, &app))?;
-            if event::poll(Duration::from_millis(80))? {
+            match app.poll_refresh() {
+                Ok(changed) => redraw |= changed,
+                Err(error) => {
+                    app.message = error.to_string();
+                    redraw = true;
+                }
+            }
+            let was_loading = app.pending_diff.is_some();
+            if app.poll_diff() {
+                let size = terminal.size()?;
+                let viewport =
+                    super::layout::active_diff_viewport_height(&app, size.width, size.height);
+                super::navigation::scroll_diff_selection_into_view(&mut app, viewport);
+                redraw = true;
+            }
+            redraw |= was_loading && app.pending_diff.is_none();
+            let visible = app.scrollbars_visible();
+            redraw |= visible != scrollbars_visible;
+            scrollbars_visible = visible;
+            if redraw {
+                terminal.draw(|frame| draw(frame, &app))?;
+                redraw = false;
+            }
+            let poll_interval = if app.pending_diff.is_some() || app.refresh_pending {
+                16
+            } else {
+                80
+            };
+            if event::poll(Duration::from_millis(poll_interval))? {
+                redraw = true;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let size = terminal.size()?;
@@ -39,6 +69,7 @@ pub(super) fn run_tui(mut app: App) -> Result<()> {
                 && let Err(error) = app.refresh()
             {
                 app.message = error.to_string();
+                redraw = true;
             }
         }
         Ok(())

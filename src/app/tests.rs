@@ -183,6 +183,99 @@ fn same_code_filter_can_hide_or_include_unchanged_rows() {
     assert_eq!(visible_diff_indices(&rows, true), vec![0, 1]);
     assert_eq!(
         rendered_diff_lines(&rows, false, DiffMode::Unified),
-        vec![RenderedDiffLine::Row(1), RenderedDiffLine::Row(1)]
+        vec![
+            RenderedDiffLine::Row {
+                row: 1,
+                occurrence: 0
+            },
+            RenderedDiffLine::Row {
+                row: 1,
+                occurrence: 1
+            },
+        ]
     );
+}
+#[test]
+fn large_file_shortcuts_return_without_waiting_for_the_diff() {
+    use crate::git::FileItem;
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
+
+    let repo = std::env::temp_dir().join(format!("luminatti-responsive-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&repo).unwrap();
+    let source = "a large source line with some content\n".repeat(100_000);
+    fs::write(repo.join("large.txt"), source).unwrap();
+    let mut app = preview_app("", "");
+    app.repo = repo.clone();
+    app.diff_mode = DiffMode::SideBySide;
+    app.files = vec![FileItem {
+        path: "large.txt".into(),
+        status: "??".into(),
+    }];
+    let start = Instant::now();
+    app.select_file(0).unwrap();
+    let elapsed = start.elapsed();
+    test_support::wait_for_diff(&mut app);
+    assert_eq!(app.diff_rows.len(), 100_000);
+    app.show_unchanged = true;
+    app.selected_row = 99_999;
+    navigation::scroll_diff_selection_into_view(&mut app, 25);
+    assert_eq!(app.diff_scroll, 99_975);
+    app.toggle_final_view(25);
+    assert_eq!(app.active_rows()[app.selected_row].new_line, Some(100_000));
+    assert_eq!(app.diff_scroll, 99_975);
+    println!("100k-line file selection: {elapsed:?}");
+    fs::remove_dir_all(repo).unwrap();
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "file selection blocked input for {elapsed:?}"
+    );
+}
+
+#[test]
+fn rapid_file_shortcuts_restore_cached_rows_and_reload_changed_sources() {
+    use std::{fs, sync::Arc};
+    let repo = std::env::temp_dir().join(format!("luminatti-switch-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&repo).unwrap();
+    let mut app = preview_app("", "");
+    app.repo = repo.clone();
+    app.diff_mode = DiffMode::SideBySide;
+    for index in 0..6 {
+        let path = format!("{index}.txt");
+        fs::write(repo.join(&path), format!("file {index}\n")).unwrap();
+        app.files.push(FileItem {
+            path,
+            status: "??".into(),
+        });
+    }
+    app.select_file(0).unwrap();
+    test_support::wait_for_diff(&mut app);
+    let first = Arc::clone(&app.diff_rows);
+    for _ in 0..5 {
+        handle_key(&mut app, KeyCode::Char('}'), 100, 25).unwrap();
+    }
+    test_support::wait_for_diff(&mut app);
+    assert_eq!(app.active_diff_path.as_deref(), Some("5.txt"));
+    assert_eq!(app.diff_rows[0].new_text, "file 5");
+    for _ in 0..5 {
+        handle_key(&mut app, KeyCode::Char('{'), 100, 25).unwrap();
+    }
+    test_support::wait_for_diff(&mut app);
+    assert!(Arc::ptr_eq(&first, &app.diff_rows));
+    fs::write(repo.join("0.txt"), "updated source\n").unwrap();
+    app.rebuild_diff().unwrap();
+    test_support::wait_for_diff(&mut app);
+    assert_eq!(app.diff_rows[0].new_text, "updated source");
+    assert!(!Arc::ptr_eq(&first, &app.diff_rows));
+    app.set_diff_mode(DiffMode::Unified).unwrap();
+    test_support::wait_for_diff(&mut app);
+    assert_eq!(app.diff_rows[0].new_text, "updated source");
+    assert_eq!(app.rendered_line_count(), 1);
+    fs::remove_file(repo.join("0.txt")).unwrap();
+    app.rebuild_diff().unwrap();
+    test_support::wait_for_diff(&mut app);
+    assert!(app.diff_rows.is_empty());
+    fs::remove_dir_all(repo).unwrap();
 }

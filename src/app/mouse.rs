@@ -89,14 +89,9 @@ pub(super) fn handle_mouse(
             } else {
                 app.focus_panel(Focus::Right);
                 if app.right_tab == RightTab::Diff {
-                    let rendered = app.rendered_lines();
-                    let scroll = clamped_diff_scroll(
-                        app.diff_scroll,
-                        rendered.len(),
-                        active_diff_viewport_height(app, terminal_width, terminal_height),
-                    );
-                    let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
-                    if let Some(index) = rendered.get(position).and_then(|line| line.row_index()) {
+                    if let Some(index) =
+                        clicked_row_index(app, mouse.row, terminal_width, terminal_height)
+                    {
                         app.selected_row = index;
                     }
                 } else {
@@ -108,10 +103,9 @@ pub(super) fn handle_mouse(
         MouseEventKind::ScrollDown
             if app.right_tab == RightTab::Diff && mouse.column >= divider =>
         {
-            let rendered = app.rendered_lines();
             app.diff_scroll = clamped_diff_scroll(
                 app.diff_scroll.saturating_add(3),
-                rendered.len(),
+                app.rendered_line_count(),
                 active_diff_viewport_height(app, terminal_width, terminal_height),
             );
         }
@@ -177,14 +171,9 @@ fn handle_maximized_mouse(
                 }
             }
             Focus::Right if app.right_tab == RightTab::Diff => {
-                let rendered = app.rendered_lines();
-                let scroll = clamped_diff_scroll(
-                    app.diff_scroll,
-                    rendered.len(),
-                    active_diff_viewport_height(app, terminal_width, terminal_height),
-                );
-                let position = scroll as usize + mouse.row.saturating_sub(1) as usize;
-                if let Some(index) = rendered.get(position).and_then(|line| line.row_index()) {
+                if let Some(index) =
+                    clicked_row_index(app, mouse.row, terminal_width, terminal_height)
+                {
                     app.selected_row = index;
                 }
             }
@@ -195,10 +184,9 @@ fn handle_maximized_mouse(
             Focus::Files => {}
         },
         MouseEventKind::ScrollDown if panel == Focus::Right && app.right_tab == RightTab::Diff => {
-            let rendered = app.rendered_lines();
             app.diff_scroll = clamped_diff_scroll(
                 app.diff_scroll.saturating_add(3),
-                rendered.len(),
+                app.rendered_line_count(),
                 active_diff_viewport_height(app, terminal_width, terminal_height),
             );
         }
@@ -214,4 +202,23 @@ fn handle_maximized_mouse(
         _ => {}
     }
     Ok(())
+}
+
+/// Row index of the rendered diff line under the mouse pointer, if any.
+fn clicked_row_index(
+    app: &App,
+    row: u16,
+    terminal_width: u16,
+    terminal_height: u16,
+) -> Option<usize> {
+    let state = app.render_state();
+    let scroll = clamped_diff_scroll(
+        app.diff_scroll,
+        state.lines.len(),
+        active_diff_viewport_height(app, terminal_width, terminal_height),
+    );
+    state
+        .lines
+        .get(scroll + row.saturating_sub(1) as usize)
+        .and_then(|line| line.row_index())
 }

@@ -7,7 +7,32 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{DiffRow, DiffSpan, StructuralChange, visible_diff_indices};
 
 const SPLIT_CONTEXT_LINES: usize = 3;
+/// Fixed gutter width of a split-view line (`" {:>5} "` and `"    · "`).
+pub(crate) const SPLIT_PREFIX_WIDTH: usize = 6;
+/// Fixed gutter width of a unified-view line (`"-      "` and `"{marker}{:>5} "`).
+pub(crate) const UNIFIED_PREFIX_WIDTH: usize = 7;
+/// Width of the `"  ···"` separator shown between distant split hunks.
+pub(crate) const SPLIT_SEPARATOR_WIDTH: usize = 5;
 pub(crate) const SELECTION_BACKGROUND: Color = Color::Rgb(62, 68, 81);
+
+/// Stop at the visible right edge before allocating styled text or measuring it.
+/// Ratatui's grapheme iterator preserves combining marks and emoji sequences.
+pub(crate) fn source_prefix(text: &str, columns: usize) -> &str {
+    if columns == usize::MAX {
+        return text;
+    }
+    let span = Span::raw(text);
+    let mut width = 0;
+    let mut end = 0;
+    for grapheme in span.styled_graphemes(Style::default()) {
+        if width >= columns {
+            break;
+        }
+        width += unicode_width::UnicodeWidthStr::width(grapheme.symbol);
+        end += grapheme.symbol.len();
+    }
+    &text[..end]
+}
 
 pub(crate) fn pad_selected_line(mut line: Line<'static>, width: u16) -> Line<'static> {
     if line.style.bg == Some(SELECTION_BACKGROUND) {
@@ -26,33 +51,22 @@ pub(crate) enum DiffMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenderedDiffLine {
-    Row(usize),
+    /// One physical line of `row`. Unified rows can span a deletion and an
+    /// insertion line; `occurrence` selects which one (0-based, top down).
+    Row {
+        row: usize,
+        occurrence: usize,
+    },
     Separator,
 }
 
 impl RenderedDiffLine {
     pub(crate) fn row_index(self) -> Option<usize> {
         match self {
-            Self::Row(index) => Some(index),
+            Self::Row { row, .. } => Some(row),
             Self::Separator => None,
         }
     }
-}
-
-pub(crate) fn displayed_diff_indices(
-    rows: &[DiffRow],
-    show_unchanged: bool,
-    mode: DiffMode,
-) -> Vec<usize> {
-    rendered_diff_lines(rows, show_unchanged, mode)
-        .into_iter()
-        .filter_map(RenderedDiffLine::row_index)
-        .fold(Vec::new(), |mut indices, index| {
-            if indices.last() != Some(&index) {
-                indices.push(index);
-            }
-            indices
-        })
 }
 
 pub(crate) fn rendered_diff_lines(
@@ -66,18 +80,97 @@ pub(crate) fn rendered_diff_lines(
 
     visible_diff_indices(rows, show_unchanged)
         .into_iter()
-        .flat_map(|index| {
-            std::iter::repeat_n(
-                RenderedDiffLine::Row(index),
-                unified_lines(index, &rows[index], usize::MAX).len(),
-            )
+        .flat_map(move |index| {
+            let row = &rows[index];
+            (0..unified_row_line_count(row)).map(move |occurrence| RenderedDiffLine::Row {
+                row: index,
+                occurrence,
+            })
         })
         .collect()
 }
 
+/// Number of physical lines a unified view spends on `row`.
+pub(crate) fn unified_row_line_count(row: &DiffRow) -> usize {
+    let deletions =
+        (row.old_line.is_some() && (row.old_changed || row.new_line.is_none())) as usize;
+    deletions + row.new_line.is_some() as usize
+}
+
+/// Renders exactly the physical line at `occurrence` of a unified row, so a
+/// viewport slice starting mid-row still paints the right half of it.
+pub(crate) fn unified_occurrence_line(
+    index: usize,
+    row: &DiffRow,
+    occurrence: usize,
+    selected: usize,
+    column_limit: usize,
+) -> Option<Line<'static>> {
+    let renders_deletion = row.old_line.is_some() && (row.old_changed || row.new_line.is_none());
+    match occurrence {
+        0 if renders_deletion => Some(unified_line(
+            index,
+            row.old_line,
+            source_prefix(&row.old_text, column_limit),
+            &row.old_spans,
+            '-',
+            true,
+            selected,
+        )),
+        occurrence if row.new_line.is_some() && occurrence <= renders_deletion as usize => {
+            Some(unified_line(
+                index,
+                row.new_line,
+                source_prefix(&row.new_text, column_limit),
+                &row.new_spans,
+                if row.new_changed { '+' } else { ' ' },
+                false,
+                selected,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Widest terminal column any rendered line can reach, without materializing
+/// styled spans. Row widths are precomputed on the diff itself.
+pub(crate) fn rendered_content_width(
+    rows: &[DiffRow],
+    lines: &[RenderedDiffLine],
+    mode: DiffMode,
+) -> usize {
+    lines
+        .iter()
+        .map(|line| match line {
+            RenderedDiffLine::Separator => SPLIT_SEPARATOR_WIDTH,
+            RenderedDiffLine::Row { row, .. } => match mode {
+                DiffMode::SideBySide => split_row_content_width(&rows[*row]),
+                DiffMode::Unified => unified_row_content_width(&rows[*row]),
+            },
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn split_row_content_width(row: &DiffRow) -> usize {
+    if row.old_line.is_none() && row.new_line.is_none() {
+        return 0;
+    }
+    SPLIT_PREFIX_WIDTH + row.old_width.max(row.new_width) as usize
+}
+
+fn unified_row_content_width(row: &DiffRow) -> usize {
+    let deletions =
+        (row.old_line.is_some() && (row.old_changed || row.new_line.is_none())) as usize;
+    let insertions = row.new_line.is_some() as usize;
+    deletions.max(insertions) * (UNIFIED_PREFIX_WIDTH + row.old_width.max(row.new_width) as usize)
+}
+
 fn split_hunk_lines(rows: &[DiffRow], show_unchanged: bool) -> Vec<RenderedDiffLine> {
     if show_unchanged {
-        return (0..rows.len()).map(RenderedDiffLine::Row).collect();
+        return (0..rows.len())
+            .map(|row| RenderedDiffLine::Row { row, occurrence: 0 })
+            .collect();
     }
 
     let mut ranges: Vec<(usize, usize)> = vec![];
@@ -100,7 +193,7 @@ fn split_hunk_lines(rows: &[DiffRow], show_unchanged: bool) -> Vec<RenderedDiffL
         if range_index > 0 {
             rendered.push(RenderedDiffLine::Separator);
         }
-        rendered.extend((start..end).map(RenderedDiffLine::Row));
+        rendered.extend((start..end).map(|row| RenderedDiffLine::Row { row, occurrence: 0 }));
     }
     rendered
 }
@@ -141,31 +234,15 @@ pub(crate) fn side_line(
     Line::from(rendered).style(selected_style(Style::default(), selected))
 }
 
+/// All physical lines of a unified row in order; test-side reference for
+/// [`unified_occurrence_line`].
+#[cfg(test)]
 pub(crate) fn unified_lines(index: usize, row: &DiffRow, selected: usize) -> Vec<Line<'static>> {
-    let mut result = vec![];
-    if row.old_line.is_some() && (row.old_changed || row.new_line.is_none()) {
-        result.push(unified_line(
-            index,
-            row.old_line,
-            &row.old_text,
-            &row.old_spans,
-            '-',
-            true,
-            selected,
-        ));
-    }
-    if row.new_line.is_some() {
-        result.push(unified_line(
-            index,
-            row.new_line,
-            &row.new_text,
-            &row.new_spans,
-            if row.new_changed { '+' } else { ' ' },
-            false,
-            selected,
-        ));
-    }
-    result
+    (0..unified_row_line_count(row))
+        .filter_map(|occurrence| {
+            unified_occurrence_line(index, row, occurrence, selected, usize::MAX)
+        })
+        .collect()
 }
 
 fn unified_line(
@@ -256,6 +333,9 @@ fn styled_source_spans(
     let mut cursor = 0;
 
     for span in spans {
+        if span.start >= text.len() {
+            break;
+        }
         let start = span.start.max(cursor).min(text.len());
         let end = span.end.min(text.len());
         if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
@@ -326,6 +406,90 @@ fn selected_style(style: Style, selected: bool) -> Style {
 mod tests {
     use super::*;
     use crate::diff::{StructuralHighlight, line_diff_document};
+
+    #[test]
+    fn source_clipping_preserves_graphemes_at_the_viewport_edge() {
+        assert_eq!(source_prefix("a界z", 2), "a界");
+        assert_eq!(source_prefix("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(source_prefix("👩‍💻x", 2), "👩‍💻");
+        assert_eq!(source_prefix("text", 0), "");
+    }
+
+    fn measured_content_width(rows: &[DiffRow], mode: DiffMode, selected: usize) -> usize {
+        let lines = rendered_diff_lines(rows, true, mode);
+        lines
+            .iter()
+            .map(|line| match line {
+                RenderedDiffLine::Separator => split_separator_line().width(),
+                RenderedDiffLine::Row { row, .. } => {
+                    let index = *row;
+                    let row = &rows[index];
+                    match mode {
+                        DiffMode::SideBySide => [
+                            side_line(
+                                index,
+                                row.old_line,
+                                &row.old_text,
+                                &row.old_spans,
+                                row.old_changed,
+                                true,
+                                selected,
+                            )
+                            .width(),
+                            side_line(
+                                index,
+                                row.new_line,
+                                &row.new_text,
+                                &row.new_spans,
+                                row.new_changed,
+                                false,
+                                selected,
+                            )
+                            .width(),
+                        ]
+                        .into_iter()
+                        .max()
+                        .unwrap(),
+                        DiffMode::Unified => unified_lines(index, row, selected)
+                            .iter()
+                            .map(Line::width)
+                            .max()
+                            .unwrap(),
+                    }
+                }
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn content_width_matches_the_widths_of_materialized_lines() {
+        let before = "short\nexport function mapEmployee(employee: PreparedEmployee): PayrollEmployee {\n  values\n}\nwideré — πsum\n";
+        let after = "short\nexport function mapEmployee(\n  employee: PreparedEmployee,\n): PayrollEmployee {\n  values\n}\nwide line moved over here\n";
+        let rows = line_diff_document(before, after).rows;
+
+        for mode in [DiffMode::Unified, DiffMode::SideBySide] {
+            for selected in [usize::MAX, 0, rows.len() - 1] {
+                let lines = rendered_diff_lines(&rows, true, mode);
+                assert_eq!(
+                    rendered_content_width(&rows, &lines, mode),
+                    measured_content_width(&rows, mode, selected),
+                    "{mode:?} / selected {selected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unified_line_count_matches_materialized_lines() {
+        let rows = line_diff_document("a\nb\nc\n", "a\nb2\nc\n").rows;
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                unified_row_line_count(row),
+                unified_lines(index, row, usize::MAX).len()
+            );
+        }
+    }
 
     #[test]
     fn missing_split_side_is_not_selected() {
@@ -436,22 +600,64 @@ mod tests {
         let rendered = rendered_diff_lines(&rows, false, DiffMode::SideBySide);
         assert_eq!(
             rendered,
-            vec![
-                RenderedDiffLine::Row(1),
-                RenderedDiffLine::Row(2),
-                RenderedDiffLine::Row(3),
-                RenderedDiffLine::Row(4),
-                RenderedDiffLine::Row(5),
-                RenderedDiffLine::Row(6),
-                RenderedDiffLine::Row(7),
+            [
+                RenderedDiffLine::Row {
+                    row: 1,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 2,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 3,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 4,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 5,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 6,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 7,
+                    occurrence: 0
+                },
                 RenderedDiffLine::Separator,
-                RenderedDiffLine::Row(16),
-                RenderedDiffLine::Row(17),
-                RenderedDiffLine::Row(18),
-                RenderedDiffLine::Row(19),
-                RenderedDiffLine::Row(20),
-                RenderedDiffLine::Row(21),
-                RenderedDiffLine::Row(22),
+                RenderedDiffLine::Row {
+                    row: 16,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 17,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 18,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 19,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 20,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 21,
+                    occurrence: 0
+                },
+                RenderedDiffLine::Row {
+                    row: 22,
+                    occurrence: 0
+                },
             ]
         );
     }

@@ -83,6 +83,13 @@ pub(crate) fn changed_files(repo: &Path) -> Result<Vec<FileItem>> {
 fn is_luminatti_metadata(path: &str) -> bool {
     path == ".luminatti" || path.starts_with(".luminatti/")
 }
+/// Current commit of `HEAD`, or an empty string before the first commit.
+pub(crate) fn head_commit(repo: &Path) -> String {
+    git_text(repo, &["rev-parse", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
 pub(crate) fn git_show_head_file(repo: &Path, path: &str) -> Result<String> {
     let spec = format!("HEAD:{path}");
     let output = git(repo, &["show", &spec])?;

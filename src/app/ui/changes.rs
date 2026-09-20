@@ -1,25 +1,39 @@
+//! Diff panel drawing. Only the visible slice of the diff is materialized
+//! into styled lines; geometry comes from the cached render state.
 use super::super::{App, navigation::clamped_diff_scroll};
 use super::widgets::{
     render_horizontal_scrollbar, render_vertical_scrollbar, right_panel_block, rounded_block,
 };
 use crate::diff_view::{
-    DiffMode, RenderedDiffLine, pad_selected_line, side_line, split_separator_line, unified_lines,
+    DiffMode, RenderedDiffLine, pad_selected_line, side_line, source_prefix, split_separator_line,
+    unified_occurrence_line,
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Constraint, Direction, Margin, Rect},
     style::{Color, Style},
     text::Line,
     widgets::{Borders, Paragraph},
 };
+
+/// The styled lines of the visible slice, per display mode.
+enum VisibleContent {
+    Unified(Vec<Line<'static>>),
+    Split {
+        old: Vec<Line<'static>>,
+        new: Vec<Line<'static>>,
+    },
+}
 
 pub(super) fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let outer = right_panel_block(app, true, false);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let diff_area = inner;
-    let visible = app.displayed_indices();
-    if visible.is_empty() {
-        let message = if app.final_view {
+    let state = app.render_state();
+    if state.lines.is_empty() {
+        let message = if app.pending_diff.is_some() && app.diff_signature.is_none() {
+            "Loading diff…".to_owned()
+        } else if app.final_view {
             "Final version is empty (file empty or deleted).".to_owned()
         } else if !app.diff_has_syntactic_changes && !app.diff_language.is_empty() {
             format!("No syntactic changes ({})", app.diff_language)
@@ -32,118 +46,102 @@ pub(super) fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let (content_length, scroll, horizontal_content, horizontal_viewport, horizontal_scroll) =
-        if app.diff_mode == DiffMode::Unified {
-            let mut lines: Vec<_> = visible
+    let content_length = state.lines.len();
+    let scroll = clamped_diff_scroll(app.diff_scroll, content_length, diff_area.height);
+    let visible_end = content_length.min(scroll + diff_area.height as usize);
+    let visible = &state.lines[scroll..visible_end];
+    let rows = app.active_rows();
+
+    let split_columns = (app.diff_mode == DiffMode::SideBySide).then(|| split_columns(diff_area));
+    let horizontal_viewport = match (&split_columns, app.diff_mode) {
+        (Some(columns), _) => columns[0].width.min(columns[1].width.saturating_sub(1)) as usize,
+        (None, _) => diff_area.width as usize,
+    };
+    let content = match app.diff_mode {
+        DiffMode::Unified => VisibleContent::Unified(
+            visible
                 .iter()
-                .flat_map(|index| {
-                    unified_lines(*index, &app.active_rows()[*index], app.selected_row)
+                .filter_map(|entry| match entry {
+                    RenderedDiffLine::Row { row, occurrence } => unified_occurrence_line(
+                        *row,
+                        &rows[*row],
+                        *occurrence,
+                        app.selected_row,
+                        app.diff_horizontal_scroll as usize + horizontal_viewport,
+                    ),
+                    RenderedDiffLine::Separator => None,
                 })
-                .collect();
-            let horizontal_content = lines.iter().map(Line::width).max().unwrap_or(0);
-            let horizontal_viewport = diff_area.width as usize;
-            let horizontal_scroll = app.diff_horizontal_scroll.min(
-                horizontal_content
-                    .saturating_sub(horizontal_viewport)
-                    .min(u16::MAX as usize) as u16,
-            );
-            let content_area = diff_area;
-            let padded_width = horizontal_content
-                .max(horizontal_viewport)
-                .min(u16::MAX as usize) as u16;
-            lines = lines
-                .into_iter()
-                .map(|line| pad_selected_line(line, padded_width))
-                .collect();
-            let scroll = clamped_diff_scroll(app.diff_scroll, lines.len(), content_area.height);
-            let content_length = lines.len();
-            frame.render_widget(
-                Paragraph::new(lines).scroll((scroll, horizontal_scroll)),
-                content_area,
-            );
-            (
-                content_length,
-                scroll as usize,
-                horizontal_content,
-                horizontal_viewport,
-                horizontal_scroll as usize,
-            )
-        } else {
-            let rendered = app.rendered_lines();
-            let initial_columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(diff_area);
-            let mut old: Vec<_> = rendered
-                .iter()
-                .map(|line| match line {
-                    RenderedDiffLine::Row(index) => {
-                        let row = &app.diff_rows[*index];
-                        side_line(
-                            *index,
+                .collect(),
+        ),
+        DiffMode::SideBySide => {
+            let mut old = Vec::with_capacity(visible.len());
+            let mut new = Vec::with_capacity(visible.len());
+            for line in visible {
+                match line {
+                    RenderedDiffLine::Row { row, .. } => {
+                        let index = *row;
+                        let row = &rows[index];
+                        old.push(side_line(
+                            index,
                             row.old_line,
-                            &row.old_text,
+                            source_prefix(
+                                &row.old_text,
+                                app.diff_horizontal_scroll as usize + horizontal_viewport,
+                            ),
                             &row.old_spans,
                             row.old_changed,
                             true,
                             app.selected_row,
-                        )
-                    }
-                    RenderedDiffLine::Separator => split_separator_line(),
-                })
-                .collect();
-            let mut new: Vec<_> = rendered
-                .iter()
-                .map(|line| match line {
-                    RenderedDiffLine::Row(index) => {
-                        let row = &app.diff_rows[*index];
-                        side_line(
-                            *index,
+                        ));
+                        new.push(side_line(
+                            index,
                             row.new_line,
-                            &row.new_text,
+                            source_prefix(
+                                &row.new_text,
+                                app.diff_horizontal_scroll as usize + horizontal_viewport,
+                            ),
                             &row.new_spans,
                             row.new_changed,
                             false,
                             app.selected_row,
-                        )
+                        ));
                     }
-                    RenderedDiffLine::Separator => split_separator_line(),
-                })
-                .collect();
-            let horizontal_content = old.iter().chain(&new).map(Line::width).max().unwrap_or(0);
-            let horizontal_viewport = initial_columns[0]
-                .width
-                .min(initial_columns[1].width.saturating_sub(1))
-                as usize;
-            let horizontal_scroll = app.diff_horizontal_scroll.min(
-                horizontal_content
-                    .saturating_sub(horizontal_viewport)
-                    .min(u16::MAX as usize) as u16,
-            );
-            let content_area = diff_area;
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(content_area);
-            let padded_width = horizontal_content
-                .max(horizontal_viewport)
-                .min(u16::MAX as usize) as u16;
-            old = old
-                .into_iter()
-                .map(|line| pad_selected_line(line, padded_width))
-                .collect();
-            new = new
-                .into_iter()
-                .map(|line| pad_selected_line(line, padded_width))
-                .collect();
-            let scroll = clamped_diff_scroll(app.diff_scroll, rendered.len(), content_area.height);
+                    RenderedDiffLine::Separator => {
+                        old.push(split_separator_line());
+                        new.push(split_separator_line());
+                    }
+                }
+            }
+            VisibleContent::Split { old, new }
+        }
+    };
+
+    let horizontal_content = state.content_width;
+    let horizontal_scroll = app.diff_horizontal_scroll.min(
+        horizontal_content
+            .saturating_sub(horizontal_viewport)
+            .min(u16::MAX as usize) as u16,
+    );
+    // Only the visible portion of the selection background needs padding.
+    let padded_width =
+        (horizontal_scroll as usize + horizontal_viewport).min(u16::MAX as usize) as u16;
+    match content {
+        VisibleContent::Unified(lines) => {
+            let lines = pad_lines(lines, padded_width);
             frame.render_widget(
-                Paragraph::new(old).scroll((scroll, horizontal_scroll)),
+                Paragraph::new(lines).scroll((0, horizontal_scroll)),
+                diff_area,
+            );
+        }
+        VisibleContent::Split { old, new } => {
+            let columns = split_columns.expect("split mode computes columns");
+            frame.render_widget(
+                Paragraph::new(pad_lines(old, padded_width)).scroll((0, horizontal_scroll)),
                 columns[0],
             );
             frame.render_widget(
-                Paragraph::new(new)
-                    .scroll((scroll, horizontal_scroll))
+                Paragraph::new(pad_lines(new, padded_width))
+                    .scroll((0, horizontal_scroll))
                     .block(
                         rounded_block()
                             .borders(Borders::LEFT)
@@ -151,14 +149,8 @@ pub(super) fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     ),
                 columns[1],
             );
-            (
-                rendered.len(),
-                scroll as usize,
-                horizontal_content,
-                horizontal_viewport,
-                horizontal_scroll as usize,
-            )
-        };
+        }
+    }
     render_vertical_scrollbar(
         frame,
         area,
@@ -175,7 +167,22 @@ pub(super) fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         }),
         horizontal_content,
         horizontal_viewport,
-        horizontal_scroll,
+        horizontal_scroll as usize,
         app.scrollbars_visible(),
     );
+}
+
+fn split_columns(area: Rect) -> [Rect; 2] {
+    let columns = ratatui::layout::Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    [columns[0], columns[1]]
+}
+
+fn pad_lines(lines: Vec<Line<'static>>, padded_width: u16) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| pad_selected_line(line, padded_width))
+        .collect()
 }

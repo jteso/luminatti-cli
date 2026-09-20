@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 pub(crate) use difftastic::{StructuralChange, StructuralHighlight};
 use difftastic::{StructuralSpan, structural_diff};
@@ -17,10 +20,19 @@ pub(crate) struct DiffRow {
     pub(crate) new_line: Option<u32>,
     pub(crate) old_text: String,
     pub(crate) new_text: String,
+    /// Saturating terminal display width, mirroring ratatui's u16 columns.
+    pub(crate) old_width: u16,
+    pub(crate) new_width: u16,
     pub(crate) old_changed: bool,
     pub(crate) new_changed: bool,
     pub(crate) old_spans: Vec<DiffSpan>,
     pub(crate) new_spans: Vec<DiffSpan>,
+}
+
+/// Terminal display width clamped to the range ratatui can address.
+pub(crate) fn display_width(text: &str) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +54,13 @@ pub(crate) fn structural_diff_document(
     before: &str,
     after: &str,
 ) -> DiffDocument {
+    // Match Difftastic's 1 MB structural limit, but use our deadline-aware
+    // line matcher for the fallback so generated files cannot monopolize it.
+    if before.len().max(after.len()) > 1_000_000 {
+        let mut document = line_diff_document(before, after);
+        document.language = "Text (large file)".into();
+        return document;
+    }
     let structural = structural_diff(display_path, before, after);
     let old_lines = source_lines(before);
     let new_lines = source_lines(after);
@@ -58,23 +77,29 @@ pub(crate) fn structural_diff_document(
             let new_line = pair
                 .new_line
                 .filter(|line| (*line as usize) <= new_lines.len());
-            (old_line.is_some() || new_line.is_some()).then(|| DiffRow {
-                old_line,
-                new_line,
-                old_text: line_text(&old_lines, old_line),
-                new_text: line_text(&new_lines, new_line),
-                old_changed: pair.old_changed,
-                new_changed: pair.new_changed,
-                old_spans: if old_line.is_some() {
-                    pair.old_spans.into_iter().map(DiffSpan::from).collect()
-                } else {
-                    vec![]
-                },
-                new_spans: if new_line.is_some() {
-                    pair.new_spans.into_iter().map(DiffSpan::from).collect()
-                } else {
-                    vec![]
-                },
+            (old_line.is_some() || new_line.is_some()).then(|| {
+                let old_text = line_text(&old_lines, old_line);
+                let new_text = line_text(&new_lines, new_line);
+                DiffRow {
+                    old_line,
+                    new_line,
+                    old_width: display_width(&old_text),
+                    new_width: display_width(&new_text),
+                    old_text,
+                    new_text,
+                    old_changed: pair.old_changed,
+                    new_changed: pair.new_changed,
+                    old_spans: if old_line.is_some() {
+                        pair.old_spans.into_iter().map(DiffSpan::from).collect()
+                    } else {
+                        vec![]
+                    },
+                    new_spans: if new_line.is_some() {
+                        pair.new_spans.into_iter().map(DiffSpan::from).collect()
+                    } else {
+                        vec![]
+                    },
+                }
             })
         })
         .collect();
@@ -87,7 +112,12 @@ pub(crate) fn structural_diff_document(
 }
 
 pub(crate) fn line_diff_document(before: &str, after: &str) -> DiffDocument {
-    let diff = TextDiff::from_lines(before, after);
+    // Share one matching budget across line alignment and all word comparisons.
+    // A deadline reduces alignment precision, never the source content retained.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let diff = TextDiff::configure()
+        .deadline(deadline)
+        .diff_lines(before, after);
     let mut rows = vec![];
     let mut old_line = 0u32;
     let mut new_line = 0u32;
@@ -106,12 +136,14 @@ pub(crate) fn line_diff_document(before: &str, after: &str) -> DiffDocument {
                 inserted.push((new_line, text));
             }
             ChangeTag::Equal => {
-                flush_line_changes(&mut rows, &mut deleted, &mut inserted);
+                flush_line_changes(&mut rows, &mut deleted, &mut inserted, deadline);
                 old_line += 1;
                 new_line += 1;
                 rows.push(DiffRow {
                     old_line: Some(old_line),
                     new_line: Some(new_line),
+                    old_width: display_width(&text),
+                    new_width: display_width(&text),
                     old_text: text.clone(),
                     new_text: text.clone(),
                     old_changed: false,
@@ -122,13 +154,33 @@ pub(crate) fn line_diff_document(before: &str, after: &str) -> DiffDocument {
             }
         }
     }
-    flush_line_changes(&mut rows, &mut deleted, &mut inserted);
+    flush_line_changes(&mut rows, &mut deleted, &mut inserted, deadline);
 
     DiffDocument {
         language: String::new(),
         has_syntactic_changes: rows.iter().any(DiffRow::is_changed),
         rows,
     }
+}
+
+/// The final view needs physical source lines, with no matching pass.
+pub(crate) fn source_document(source: &str) -> Vec<DiffRow> {
+    source
+        .lines()
+        .enumerate()
+        .map(|(index, text)| DiffRow {
+            old_line: Some(index as u32 + 1),
+            new_line: Some(index as u32 + 1),
+            old_text: text.to_owned(),
+            new_text: text.to_owned(),
+            old_width: display_width(text),
+            new_width: display_width(text),
+            old_changed: false,
+            new_changed: false,
+            old_spans: vec![],
+            new_spans: vec![],
+        })
+        .collect()
 }
 
 fn source_line(value: &str) -> &str {
@@ -140,13 +192,16 @@ fn flush_line_changes(
     rows: &mut Vec<DiffRow>,
     deleted: &mut Vec<(u32, String)>,
     inserted: &mut Vec<(u32, String)>,
+    deadline: Instant,
 ) {
     let changed_count = deleted.len().max(inserted.len());
     for index in 0..changed_count {
         let old = deleted.get(index);
         let new = inserted.get(index);
         let (old_spans, new_spans) = match (old, new) {
-            (Some((_, old_text)), Some((_, new_text))) => word_diff_spans(old_text, new_text),
+            (Some((_, old_text)), Some((_, new_text))) => {
+                word_diff_spans(old_text, new_text, deadline)
+            }
             (Some((_, old_text)), None) => {
                 (whole_line_span(old_text, StructuralChange::Novel), vec![])
             }
@@ -158,6 +213,8 @@ fn flush_line_changes(
         rows.push(DiffRow {
             old_line: old.map(|(line, _)| *line),
             new_line: new.map(|(line, _)| *line),
+            old_width: old.map(|(_, text)| display_width(text)).unwrap_or(0),
+            new_width: new.map(|(_, text)| display_width(text)).unwrap_or(0),
             old_text: old.map(|(_, text)| text.clone()).unwrap_or_default(),
             new_text: new.map(|(_, text)| text.clone()).unwrap_or_default(),
             old_changed: old.is_some(),
@@ -170,10 +227,18 @@ fn flush_line_changes(
     inserted.clear();
 }
 
-fn word_diff_spans(old: &str, new: &str) -> (Vec<DiffSpan>, Vec<DiffSpan>) {
+fn word_diff_spans(old: &str, new: &str, deadline: Instant) -> (Vec<DiffSpan>, Vec<DiffSpan>) {
+    if Instant::now() >= deadline {
+        return (
+            whole_line_span(old, StructuralChange::Novel),
+            whole_line_span(new, StructuralChange::Novel),
+        );
+    }
     let old_tokens = lexical_tokens(old);
     let new_tokens = lexical_tokens(new);
-    let diff = TextDiff::from_slices(&old_tokens, &new_tokens);
+    let diff = TextDiff::configure()
+        .deadline(deadline)
+        .diff_slices(&old_tokens, &new_tokens);
     let mut old_spans = vec![];
     let mut new_spans = vec![];
     let mut old_cursor = 0;
@@ -317,6 +382,54 @@ pub(crate) fn adjacent_changed_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_deadline_preserves_both_complete_sources() {
+        let before = (0..20_000)
+            .map(|i| format!("old_{i}\n"))
+            .collect::<String>();
+        let after = (0..20_000)
+            .map(|i| format!("new_{i}\n"))
+            .collect::<String>();
+        let document = line_diff_document(&before, &after);
+        let old = document
+            .rows
+            .iter()
+            .filter(|row| row.old_line.is_some())
+            .map(|row| row.old_text.as_str())
+            .collect::<Vec<_>>();
+        let new = document
+            .rows
+            .iter()
+            .filter(|row| row.new_line.is_some())
+            .map(|row| row.new_text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(old, before.lines().collect::<Vec<_>>());
+        assert_eq!(new, after.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn structural_diff_scales_to_large_source_files() {
+        let before = (0..12_000)
+            .map(|i| format!("const value{i} = {i};\n"))
+            .collect::<String>();
+        let after = before.replace("value6000 = 6000", "value6000 = 99999");
+        let start = std::time::Instant::now();
+        let document = structural_diff_document(Path::new("large.ts"), &before, &after);
+        let elapsed = start.elapsed();
+        println!("12k-line structural diff: {elapsed:?}");
+        assert_eq!(document.rows.len(), 12_000);
+        assert!(
+            document
+                .rows
+                .iter()
+                .any(|row| row.new_text == "const value6000 = 99999;" && row.is_changed())
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "structural diff took {elapsed:?}"
+        );
+    }
 
     fn changed_text<'a>(text: &'a str, spans: &[DiffSpan]) -> Vec<&'a str> {
         spans

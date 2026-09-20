@@ -12,6 +12,13 @@ change emphasis, three lines of surrounding context, and collapsed-gap hunk
 separators. Difftastic's native line-oriented fallbacks remain available for
 unsupported or unparsable inputs in unified view.
 
+File loading, diff calculation, and Git status refresh run in background workers.
+Rapid file navigation keeps only the latest pending request; completed diffs are
+cached with a 64 MiB budget (plus an oversized active file). Files over 1 MB use
+line matching with a shared 100 ms matching budget. If matching reaches that
+budget, highlighting becomes coarser while all source lines remain available.
+Rendering only styles the visible rows and columns.
+
 ```sh
 cargo run --release --bin luminatti -- .
 cargo run --release --bin luminatti -- /path/to/repository

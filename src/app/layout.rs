@@ -1,52 +1,10 @@
 //! Shared geometry for drawing, scrolling, and mouse hit testing.
 use super::{App, Focus};
-use crate::diff_view::{
-    DiffMode, RenderedDiffLine, side_line, split_separator_line, unified_lines,
-};
+use crate::diff_view::DiffMode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 pub(super) fn diff_content_width(app: &App) -> usize {
-    if app.diff_mode == DiffMode::Unified {
-        return app
-            .displayed_indices()
-            .iter()
-            .flat_map(|index| unified_lines(*index, &app.active_rows()[*index], app.selected_row))
-            .map(|line| line.width())
-            .max()
-            .unwrap_or(0);
-    }
-
-    app.rendered_lines()
-        .iter()
-        .map(|line| match line {
-            RenderedDiffLine::Row(index) => {
-                let row = &app.diff_rows[*index];
-                let old = side_line(
-                    *index,
-                    row.old_line,
-                    &row.old_text,
-                    &row.old_spans,
-                    row.old_changed,
-                    true,
-                    app.selected_row,
-                )
-                .width();
-                let new = side_line(
-                    *index,
-                    row.new_line,
-                    &row.new_text,
-                    &row.new_spans,
-                    row.new_changed,
-                    false,
-                    app.selected_row,
-                )
-                .width();
-                old.max(new)
-            }
-            RenderedDiffLine::Separator => split_separator_line().width(),
-        })
-        .max()
-        .unwrap_or(0)
+    app.diff_content_width()
 }
 
 pub(super) fn diff_inner_width(app: &App, terminal_width: u16) -> u16 {

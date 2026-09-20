@@ -501,11 +501,19 @@ pub fn structural_diff(display_path: &Path, before: &str, after: &str) -> Struct
             .collect();
     }
 
+    let old_spans_by_line = index_spans(&result.lhs_positions, old_lines.len());
+    let new_spans_by_line = index_spans(&result.rhs_positions, new_lines.len());
     let lines = aligned
         .into_iter()
         .map(|(old_line, new_line)| {
-            let old_spans = spans_for_line(old_line, &result.lhs_positions);
-            let new_spans = spans_for_line(new_line, &result.rhs_positions);
+            let old_spans = old_line
+                .and_then(|line| old_spans_by_line.get(line.0 as usize))
+                .cloned()
+                .unwrap_or_default();
+            let new_spans = new_line
+                .and_then(|line| new_spans_by_line.get(line.0 as usize))
+                .cloned()
+                .unwrap_or_default();
             let old_changed = old_spans.iter().any(|span| span.change.is_changed())
                 || (old_line.is_some() && new_line.is_none());
             let new_changed = new_spans.iter().any(|span| span.change.is_changed())
@@ -531,26 +539,20 @@ pub fn structural_diff(display_path: &Path, before: &str, after: &str) -> Struct
     }
 }
 
-fn spans_for_line(
-    line: Option<line_numbers::LineNumber>,
-    positions: &[syntax::MatchedPos],
-) -> Vec<StructuralSpan> {
-    let Some(line) = line else {
-        return vec![];
-    };
-
-    let mut spans = positions
-        .iter()
-        .filter(|position| position.pos.line == line)
-        .map(|position| StructuralSpan {
+fn index_spans(positions: &[syntax::MatchedPos], line_count: usize) -> Vec<Vec<StructuralSpan>> {
+    let mut lines = vec![vec![]; line_count];
+    for position in positions {
+        lines[position.pos.line.0 as usize].push(StructuralSpan {
             start: position.pos.start_col,
             end: position.pos.end_col,
             change: structural_change(&position.kind),
             highlight: structural_highlight(&position.kind),
-        })
-        .collect::<Vec<_>>();
-    spans.sort_unstable_by_key(|span| (span.start, span.end));
-    spans
+        });
+    }
+    for spans in &mut lines {
+        spans.sort_unstable_by_key(|span| (span.start, span.end));
+    }
+    lines
 }
 
 fn structural_change(kind: &syntax::MatchKind) -> StructuralChange {

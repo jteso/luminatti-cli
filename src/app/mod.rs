@@ -11,8 +11,10 @@ use crate::{
 };
 use anyhow::Result;
 use std::{
+    cell::RefCell,
     collections::BTreeSet,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -25,6 +27,9 @@ mod navigation;
 mod review;
 mod terminal;
 mod ui;
+mod worker;
+
+use self::diff::{DiffRenderState, DiffWorker, LoadedDiff, PendingDiff};
 
 #[cfg(test)]
 mod test_support;
@@ -36,6 +41,8 @@ pub(crate) fn run(repo: PathBuf) -> Result<()> {
 }
 
 const SCROLLBAR_VISIBILITY_DURATION: Duration = Duration::from_secs(3);
+
+type RefreshWorker = worker::Worker<(), Result<(Vec<FileItem>, RemoteStatus)>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RightTab {
@@ -86,8 +93,8 @@ struct App {
     diff_mode: DiffMode,
     show_unchanged: bool,
     final_view: bool,
-    final_rows: Vec<DiffRow>,
-    final_origin: Option<(usize, usize, u16)>,
+    final_rows: Arc<Vec<DiffRow>>,
+    final_origin: Option<(usize, usize, usize)>,
     selected_file: usize,
     selected_filter: usize,
     selected_ignored: usize,
@@ -96,18 +103,28 @@ struct App {
     collapsed_dirs: BTreeSet<String>,
     divider: u16,
     dragging_divider: bool,
-    diff_rows: Vec<DiffRow>,
+    diff_rows: Arc<Vec<DiffRow>>,
     diff_language: String,
     diff_has_syntactic_changes: bool,
-    diff_scroll: u16,
+    diff_scroll: usize,
     diff_horizontal_scroll: u16,
     diff_signature: Option<u64>,
+    /// Path of the file whose diff is currently rendered, if any.
+    active_diff_path: Option<String>,
+    diff_worker: Option<DiffWorker>,
+    pending_diff: Option<PendingDiff>,
+    loaded_diff: Option<Arc<LoadedDiff>>,
+    diff_anchor: Option<(Option<u32>, Option<u32>)>,
+    select_last_change: bool,
+    render_state_slot: RefCell<Option<Arc<DiffRenderState>>>,
     input: Option<Input>,
     confirmation: Option<ConfirmationKind>,
     show_help: bool,
     message: String,
     remote: RemoteStatus,
     last_refresh: Instant,
+    refresh_worker: Option<RefreshWorker>,
+    refresh_pending: bool,
     scrollbar_visible_until: Option<Instant>,
 }
 
@@ -129,7 +146,7 @@ impl App {
             diff_mode: settings.diff_mode,
             show_unchanged: settings.show_unchanged,
             final_view: false,
-            final_rows: vec![],
+            final_rows: Arc::default(),
             final_origin: None,
             selected_file: 0,
             selected_filter: 0,
@@ -139,18 +156,27 @@ impl App {
             collapsed_dirs: BTreeSet::new(),
             divider: settings.divider,
             dragging_divider: false,
-            diff_rows: vec![],
+            diff_rows: Arc::default(),
             diff_language: String::new(),
             diff_has_syntactic_changes: false,
             diff_scroll: 0,
             diff_horizontal_scroll: 0,
             diff_signature: None,
+            active_diff_path: None,
+            diff_worker: None,
+            pending_diff: None,
+            loaded_diff: None,
+            diff_anchor: None,
+            select_last_change: false,
+            render_state_slot: RefCell::new(None),
             input: None,
             confirmation: None,
             show_help: false,
             message: "watching worktree".into(),
             remote: RemoteStatus::default(),
             last_refresh: Instant::now() - Duration::from_secs(1),
+            refresh_worker: None,
+            refresh_pending: false,
             scrollbar_visible_until: None,
         };
         app.refresh()?;
@@ -182,13 +208,45 @@ impl App {
                 AgentCommentFile::List(comments) => comments,
                 AgentCommentFile::Empty => vec![],
             };
+        if self.refresh_worker.is_none() {
+            let repo = self.repo.clone();
+            self.refresh_worker = Some(worker::Worker::spawn("worktree-refresh", move |()| {
+                Ok((changed_files(&repo)?, remote_status(&repo)))
+            })?);
+        }
+        if !self.refresh_pending {
+            self.refresh_worker
+                .as_mut()
+                .expect("worker initialized")
+                .request(());
+            self.refresh_pending = true;
+        }
+        self.last_refresh = Instant::now();
+        Ok(())
+    }
+
+    fn poll_refresh(&mut self) -> Result<bool> {
+        let Some((_, result)) = self.refresh_worker.as_ref().and_then(worker::Worker::take) else {
+            return Ok(false);
+        };
+        self.refresh_pending = false;
+        let (files, remote) = result?;
+        let previous_path = self.active_path().map(str::to_owned);
         let filter = compile_filters(&self.filters.patterns)?;
-        let (ignored_files, files) = partition_filtered_files(changed_files(&self.repo)?, &filter);
+        let (ignored_files, files) = partition_filtered_files(files, &filter);
         self.files = files;
         self.ignored_files = ignored_files;
         self.selected_file = self
             .selected_file
             .min(self.file_tree_rows().len().saturating_sub(1));
+        if let Some(path) = previous_path
+            && let Some(index) = self
+                .file_tree_rows()
+                .iter()
+                .position(|row| row.path == path)
+        {
+            self.selected_file = index;
+        }
         self.selected_filter = self
             .selected_filter
             .min(self.filters.patterns.len().saturating_sub(1));
@@ -199,8 +257,7 @@ impl App {
             .selected_comment
             .min(self.all_comments().len().saturating_sub(1));
         self.rebuild_diff()?;
-        self.remote = remote_status(&self.repo);
-        self.last_refresh = Instant::now();
-        Ok(())
+        self.remote = remote;
+        Ok(true)
     }
 }

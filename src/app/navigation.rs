@@ -1,18 +1,21 @@
 //! Selection movement and scroll bounds independent of input devices.
+use super::diff::selected_line_position;
 use super::{App, Focus, RightTab, layout::max_diff_horizontal_scroll};
 use crate::{
-    diff::{DiffRow, adjacent_changed_row, changed_row_indices},
+    diff::{DiffRow, adjacent_changed_row},
     file_tree::adjacent_file_index,
 };
 use anyhow::Result;
 
-pub(super) fn max_diff_scroll(content_height: usize, viewport_height: u16) -> u16 {
-    content_height
-        .saturating_sub(viewport_height as usize)
-        .min(u16::MAX as usize) as u16
+pub(super) fn max_diff_scroll(content_height: usize, viewport_height: u16) -> usize {
+    content_height.saturating_sub(viewport_height as usize)
 }
 
-pub(super) fn clamped_diff_scroll(scroll: u16, content_height: usize, viewport_height: u16) -> u16 {
+pub(super) fn clamped_diff_scroll(
+    scroll: usize,
+    content_height: usize,
+    viewport_height: u16,
+) -> usize {
     scroll.min(max_diff_scroll(content_height, viewport_height))
 }
 
@@ -39,34 +42,43 @@ pub(super) fn nearest_source_row(rows: &[DiffRow], line: Option<u32>) -> usize {
 }
 
 pub(super) fn move_diff_selection(app: &mut App, down: bool, viewport_height: u16) {
-    let visible = app.displayed_indices();
-    if visible.is_empty() {
-        return;
-    }
-    let current = visible
-        .iter()
-        .position(|index| *index == app.selected_row)
-        .unwrap_or(0);
-    let next = if down {
-        (current + 1).min(visible.len() - 1)
-    } else {
-        current.saturating_sub(1)
+    let next_index = {
+        let state = app.render_state();
+        if state.indices.is_empty() {
+            None
+        } else {
+            let current = state
+                .indices
+                .iter()
+                .position(|index| *index == app.selected_row)
+                .unwrap_or(0);
+            let next = if down {
+                (current + 1).min(state.indices.len() - 1)
+            } else {
+                current.saturating_sub(1)
+            };
+            Some(state.indices[next])
+        }
     };
-    app.selected_row = visible[next];
+    let Some(next_index) = next_index else {
+        return;
+    };
+    app.selected_row = next_index;
     scroll_diff_selection_into_view(app, viewport_height);
 }
 
 pub(super) fn scroll_diff_selection_into_view(app: &mut App, viewport_height: u16) {
-    let rendered = app.rendered_lines();
-    let rendered_start = rendered
-        .iter()
-        .position(|line| line.row_index() == Some(app.selected_row))
-        .unwrap_or(0);
-    let rendered_end = rendered
-        .iter()
-        .rposition(|line| line.row_index() == Some(app.selected_row))
-        .unwrap_or(rendered_start);
-    let mut scroll = clamped_diff_scroll(app.diff_scroll, rendered.len(), viewport_height) as usize;
+    let (content_length, rendered_start, rendered_end) = {
+        let state = app.render_state();
+        let rendered_start = selected_line_position(&state.lines, app.selected_row);
+        let rendered_end = state
+            .lines
+            .iter()
+            .rposition(|line| line.row_index() == Some(app.selected_row))
+            .unwrap_or(rendered_start);
+        (state.lines.len(), rendered_start, rendered_end)
+    };
+    let mut scroll = clamped_diff_scroll(app.diff_scroll, content_length, viewport_height);
     if rendered_start < scroll {
         scroll = rendered_start;
     } else if rendered_end >= scroll + viewport_height as usize {
@@ -74,11 +86,7 @@ pub(super) fn scroll_diff_selection_into_view(app: &mut App, viewport_height: u1
             .saturating_add(1)
             .saturating_sub(viewport_height as usize);
     }
-    app.diff_scroll = clamped_diff_scroll(
-        scroll.min(u16::MAX as usize) as u16,
-        rendered.len(),
-        viewport_height,
-    );
+    app.diff_scroll = clamped_diff_scroll(scroll, content_length, viewport_height);
 }
 
 pub(super) fn move_change_selection(
@@ -103,10 +111,7 @@ pub(super) fn move_change_selection(
     let current_file = app.active_file_index();
     if let Some(file_index) = adjacent_file_index(&app.files, current_file, forward) {
         app.select_file(file_index)?;
-        if !forward && let Some(last_change) = changed_row_indices(&app.diff_rows).last().copied() {
-            app.selected_row = last_change;
-            scroll_diff_selection_into_view(app, viewport_height);
-        }
+        app.select_last_change = !forward;
     } else {
         app.message = if forward {
             "already at the last changed file"
@@ -135,8 +140,9 @@ pub(super) fn move_file_selection(app: &mut App, forward: bool) -> Result<()> {
 
 pub(super) fn toggle_unchanged(app: &mut App) {
     app.show_unchanged = !app.show_unchanged;
-    let displayed = app.displayed_indices();
-    if !app.show_unchanged && !displayed.contains(&app.selected_row) {
+    let selected_hidden =
+        !app.show_unchanged && !app.render_state().indices.contains(&app.selected_row);
+    if selected_hidden {
         app.selected_row = app
             .diff_rows
             .iter()
@@ -172,5 +178,6 @@ mod tests {
         assert_eq!(clamped_diff_scroll(12, 22, 40), 0);
         assert_eq!(max_diff_scroll(60, 40), 20);
         assert_eq!(clamped_diff_scroll(30, 60, 40), 20);
+        assert_eq!(max_diff_scroll(100_000, 40), 99_960);
     }
 }
