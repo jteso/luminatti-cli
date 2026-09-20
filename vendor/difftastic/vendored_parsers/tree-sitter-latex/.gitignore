@@ -528,4 +528,5 @@ src/tree_sitter/
 # checkout buildable without requiring tree-sitter-cli at install time.
 !src/parser.c
 !src/tree_sitter/
+src/tree_sitter/*.h
 !src/tree_sitter/parser.h
