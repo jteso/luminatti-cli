@@ -38,11 +38,19 @@ pub(super) fn draw_diff(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         } else if !app.diff_has_syntactic_changes && !app.diff_language.is_empty() {
             format!("No syntactic changes ({})", app.diff_language)
         } else {
-            "No changed lines to display.".to_owned()
+            "No changes to display".to_owned()
+        };
+        let line = Rect {
+            x: diff_area.x,
+            y: diff_area.y + diff_area.height.saturating_sub(1) / 2,
+            width: diff_area.width,
+            height: 1,
         };
         frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(Color::DarkGray)),
-            diff_area,
+            Paragraph::new(message)
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+            line,
         );
         return;
     }
