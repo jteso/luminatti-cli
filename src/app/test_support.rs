@@ -38,6 +38,7 @@ pub(super) fn preview_app(before: &str, after: &str) -> App {
         selected_ignored: 0,
         selected_comment: 0,
         selected_row: 0,
+        diff_selection_active: true,
         collapsed_dirs: BTreeSet::new(),
         divider: 34,
         dragging_divider: false,

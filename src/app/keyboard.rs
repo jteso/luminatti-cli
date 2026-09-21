@@ -147,6 +147,7 @@ pub(super) fn handle_key(
     }
     match code {
         KeyCode::Char('q') => return Ok(true),
+        KeyCode::Esc if app.right_tab == RightTab::Diff => app.diff_selection_active = false,
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Char('/') => {
             app.input = Some(Input {

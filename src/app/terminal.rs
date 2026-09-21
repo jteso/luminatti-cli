@@ -1,5 +1,5 @@
 //! Terminal session and event loop.
-use super::{App, keyboard::handle_key, mouse::handle_mouse, ui::draw};
+use super::{App, cursor_blink_visible, keyboard::handle_key, mouse::handle_mouse, ui::draw};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
@@ -18,6 +18,7 @@ pub(super) fn run_tui(mut app: App) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut redraw = true;
         let mut scrollbars_visible = app.scrollbars_visible();
+        let mut cursor_visible = cursor_blink_visible();
         loop {
             match app.poll_refresh() {
                 Ok(changed) => redraw |= changed,
@@ -38,6 +39,11 @@ pub(super) fn run_tui(mut app: App) -> Result<()> {
             let visible = app.scrollbars_visible();
             redraw |= visible != scrollbars_visible;
             scrollbars_visible = visible;
+            if app.input.is_some() {
+                let blinking = cursor_blink_visible();
+                redraw |= blinking != cursor_visible;
+                cursor_visible = blinking;
+            }
             if redraw {
                 terminal.draw(|frame| draw(frame, &app))?;
                 redraw = false;

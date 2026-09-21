@@ -7,13 +7,19 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{DiffRow, DiffSpan, StructuralChange, visible_diff_indices};
 
 const SPLIT_CONTEXT_LINES: usize = 3;
-/// Fixed gutter width of a split-view line (`" {:>5} "` and `"    · "`).
-pub(crate) const SPLIT_PREFIX_WIDTH: usize = 6;
-/// Fixed gutter width of a unified-view line (`"-      "` and `"{marker}{:>5} "`).
-pub(crate) const UNIFIED_PREFIX_WIDTH: usize = 7;
+/// Fixed gutter width of a split-view line (`"-{line:>5} "`).
+pub(crate) const SPLIT_PREFIX_WIDTH: usize = 7;
+/// Fixed gutter width of a unified-view line (`"-{old:>5} {new:>5} "`).
+pub(crate) const UNIFIED_PREFIX_WIDTH: usize = 13;
 /// Width of the `"  ···"` separator shown between distant split hunks.
 pub(crate) const SPLIT_SEPARATOR_WIDTH: usize = 5;
-pub(crate) const SELECTION_BACKGROUND: Color = Color::Rgb(62, 68, 81);
+const UNIFIED_SEPARATOR_WIDTH: usize = UNIFIED_PREFIX_WIDTH + 3;
+pub(crate) const SELECTION_BACKGROUND: Color = Color::Rgb(48, 53, 64);
+const ADDITION_BACKGROUND: Color = Color::Rgb(30, 53, 42);
+const DELETION_BACKGROUND: Color = Color::Rgb(59, 37, 40);
+const ADDITION_TOKEN_BACKGROUND: Color = Color::Rgb(63, 111, 70);
+const DELETION_TOKEN_BACKGROUND: Color = Color::Rgb(122, 52, 52);
+const MISSING_DOT_COLOR: Color = Color::Rgb(76, 82, 94);
 
 /// Stop at the visible right edge before allocating styled text or measuring it.
 /// Ratatui's grapheme iterator preserves combining marks and emoji sequences.
@@ -34,12 +40,21 @@ pub(crate) fn source_prefix(text: &str, columns: usize) -> &str {
     &text[..end]
 }
 
-pub(crate) fn pad_selected_line(mut line: Line<'static>, width: u16) -> Line<'static> {
-    if line.style.bg == Some(SELECTION_BACKGROUND) {
+pub(crate) fn pad_line_background(mut line: Line<'static>, width: u16) -> Line<'static> {
+    if line.style.bg.is_some() {
         let padding = (width as usize).saturating_sub(line.width());
         line.spans.push(Span::raw(" ".repeat(padding)));
     }
     line
+}
+
+pub(crate) fn missing_line(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "·".repeat(width as usize),
+        Style::default()
+            .fg(MISSING_DOT_COLOR)
+            .add_modifier(Modifier::DIM),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,16 +93,21 @@ pub(crate) fn rendered_diff_lines(
         return split_hunk_lines(rows, show_unchanged);
     }
 
-    visible_diff_indices(rows, show_unchanged)
-        .into_iter()
-        .flat_map(move |index| {
-            let row = &rows[index];
-            (0..unified_row_line_count(row)).map(move |occurrence| RenderedDiffLine::Row {
+    let mut rendered = vec![];
+    let mut previous = None;
+    for index in visible_diff_indices(rows, show_unchanged) {
+        if previous.is_some_and(|previous| index > previous + 1) {
+            rendered.push(RenderedDiffLine::Separator);
+        }
+        rendered.extend((0..unified_row_line_count(&rows[index])).map(|occurrence| {
+            RenderedDiffLine::Row {
                 row: index,
                 occurrence,
-            })
-        })
-        .collect()
+            }
+        }));
+        previous = Some(index);
+    }
+    rendered
 }
 
 /// Number of physical lines a unified view spends on `row`.
@@ -103,14 +123,14 @@ pub(crate) fn unified_occurrence_line(
     index: usize,
     row: &DiffRow,
     occurrence: usize,
-    selected: usize,
+    selected: Option<usize>,
     column_limit: usize,
 ) -> Option<Line<'static>> {
     let renders_deletion = row.old_line.is_some() && (row.old_changed || row.new_line.is_none());
     match occurrence {
         0 if renders_deletion => Some(unified_line(
             index,
-            row.old_line,
+            [row.old_line, None],
             source_prefix(&row.old_text, column_limit),
             &row.old_spans,
             '-',
@@ -120,7 +140,10 @@ pub(crate) fn unified_occurrence_line(
         occurrence if row.new_line.is_some() && occurrence <= renders_deletion as usize => {
             Some(unified_line(
                 index,
-                row.new_line,
+                [
+                    if row.new_changed { None } else { row.old_line },
+                    row.new_line,
+                ],
                 source_prefix(&row.new_text, column_limit),
                 &row.new_spans,
                 if row.new_changed { '+' } else { ' ' },
@@ -142,12 +165,24 @@ pub(crate) fn rendered_content_width(
     lines
         .iter()
         .map(|line| match line {
-            RenderedDiffLine::Separator => SPLIT_SEPARATOR_WIDTH,
+            RenderedDiffLine::Separator => match mode {
+                DiffMode::SideBySide => SPLIT_SEPARATOR_WIDTH,
+                DiffMode::Unified => UNIFIED_SEPARATOR_WIDTH,
+            },
             RenderedDiffLine::Row { row, .. } => match mode {
                 DiffMode::SideBySide => split_row_content_width(&rows[*row]),
                 DiffMode::Unified => unified_row_content_width(&rows[*row]),
             },
         })
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn rendered_source_content_width(rows: &[DiffRow], lines: &[RenderedDiffLine]) -> usize {
+    lines
+        .iter()
+        .filter_map(|line| line.row_index())
+        .map(|row| SPLIT_PREFIX_WIDTH + rows[row].new_width as usize)
         .max()
         .unwrap_or(0)
 }
@@ -207,6 +242,15 @@ pub(crate) fn split_separator_line() -> Line<'static> {
     ))
 }
 
+pub(crate) fn unified_separator_line() -> Line<'static> {
+    Line::from(Span::styled(
+        format!("{}···", " ".repeat(UNIFIED_PREFIX_WIDTH)),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    ))
+}
+
 pub(crate) fn side_line(
     index: usize,
     line: Option<u32>,
@@ -214,30 +258,40 @@ pub(crate) fn side_line(
     spans: &[DiffSpan],
     changed: bool,
     deletion: bool,
-    selected: usize,
+    selected: Option<usize>,
 ) -> Line<'static> {
-    let prefix = line
+    let missing = line.is_none();
+    let number = line
         .map(|n| format!("{:>5} ", n))
-        .unwrap_or_else(|| "    · ".into());
-    let selected = index == selected && line.is_some();
-    let prefix_style = if line.is_none() {
+        .unwrap_or_else(|| "      ".into());
+    let selected = Some(index) == selected && line.is_some();
+    let changed = changed && line.is_some();
+    let number_style = if missing {
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM)
     } else {
-        selected_style(changed_style(changed, deletion), selected).add_modifier(Modifier::DIM)
+        selected_style(gutter_number_style(changed, deletion), selected)
     };
-    let mut rendered = vec![Span::styled(prefix, prefix_style)];
-    rendered.extend(styled_source_spans(
-        text, spans, changed, deletion, selected,
-    ));
-    Line::from(rendered).style(selected_style(Style::default(), selected))
+    let mut rendered = vec![
+        Span::styled(
+            diff_marker(changed, deletion).to_string(),
+            selected_style(gutter_marker_style(changed, deletion), selected),
+        ),
+        Span::styled(number, number_style),
+    ];
+    rendered.extend(styled_source_spans(text, spans, deletion, selected));
+    Line::from(rendered).style(row_style(changed, deletion, selected))
 }
 
 /// All physical lines of a unified row in order; test-side reference for
 /// [`unified_occurrence_line`].
 #[cfg(test)]
-pub(crate) fn unified_lines(index: usize, row: &DiffRow, selected: usize) -> Vec<Line<'static>> {
+pub(crate) fn unified_lines(
+    index: usize,
+    row: &DiffRow,
+    selected: Option<usize>,
+) -> Vec<Line<'static>> {
     (0..unified_row_line_count(row))
         .filter_map(|occurrence| {
             unified_occurrence_line(index, row, occurrence, selected, usize::MAX)
@@ -247,88 +301,36 @@ pub(crate) fn unified_lines(index: usize, row: &DiffRow, selected: usize) -> Vec
 
 fn unified_line(
     index: usize,
-    line: Option<u32>,
+    line_numbers: [Option<u32>; 2],
     text: &str,
     spans: &[DiffSpan],
     marker: char,
     deletion: bool,
-    selected: usize,
+    selected: Option<usize>,
 ) -> Line<'static> {
-    let selected = index == selected;
+    let selected = Some(index) == selected;
     let changed = marker != ' ';
-    let prefix_style = selected_style(changed_style(changed, deletion), selected);
-    let mut rendered = vec![Span::styled(
-        if deletion {
-            "-      ".to_owned()
-        } else {
-            format!("{}{:>5} ", marker, line.unwrap_or(0))
-        },
-        if deletion {
-            selected_style(Style::default().fg(Color::Rgb(165, 112, 116)), selected)
-        } else {
-            prefix_style
-        }
-        .add_modifier(Modifier::DIM),
-    )];
-    let source_spans = styled_source_spans(text, spans, changed, deletion, selected);
-    let mut source = Vec::with_capacity(source_spans.len());
-    let mut deletion_content_started = false;
-    for span in source_spans {
-        let mut style = span.style.remove_modifier(Modifier::UNDERLINED);
-        if deletion {
-            let color = if style.fg == Some(Color::LightRed) {
-                Color::Rgb(165, 112, 116)
-            } else {
-                Color::Rgb(140, 143, 150)
-            };
-            style = style.fg(color).remove_modifier(Modifier::BOLD);
-        }
-
-        let content = span.content.into_owned();
-        if !deletion {
-            source.push(Span::styled(content, style));
-            continue;
-        }
-        if deletion_content_started {
-            source.push(Span::styled(
-                content,
-                style.add_modifier(Modifier::CROSSED_OUT),
-            ));
-            continue;
-        }
-        let Some(content_start) = content
-            .char_indices()
-            .find_map(|(index, character)| (!character.is_whitespace()).then_some(index))
-        else {
-            source.push(Span::styled(content, style));
-            continue;
-        };
-
-        deletion_content_started = true;
-        if content_start > 0 {
-            source.push(Span::styled(content[..content_start].to_owned(), style));
-        }
-        source.push(Span::styled(
-            content[content_start..].to_owned(),
-            style.add_modifier(Modifier::CROSSED_OUT),
-        ));
-    }
-    rendered.extend(source);
-    Line::from(rendered).style(selected_style(Style::default(), selected))
+    let mut rendered = vec![
+        Span::styled(
+            marker.to_string(),
+            selected_style(gutter_marker_style(changed, deletion), selected),
+        ),
+        Span::styled(
+            gutter_numbers(line_numbers),
+            selected_style(gutter_number_style(changed, deletion), selected),
+        ),
+    ];
+    rendered.extend(styled_source_spans(text, spans, deletion, selected));
+    Line::from(rendered).style(row_style(changed, deletion, selected))
 }
 
 fn styled_source_spans(
     text: &str,
     spans: &[DiffSpan],
-    line_changed: bool,
     deletion: bool,
     selected: bool,
 ) -> Vec<Span<'static>> {
-    let fallback = if line_changed && !spans.iter().any(|span| span.change.is_changed()) {
-        changed_style(true, deletion)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
+    let fallback = Style::default().fg(Color::Gray);
     let mut rendered = vec![];
     let mut cursor = 0;
 
@@ -368,30 +370,73 @@ fn styled_source_spans(
     rendered
 }
 
-fn changed_style(changed: bool, deletion: bool) -> Style {
-    if changed {
-        Style::default().fg(if deletion {
-            Color::LightRed
-        } else {
-            Color::LightGreen
-        })
-    } else {
-        Style::default().fg(Color::Gray)
+fn diff_marker(changed: bool, deletion: bool) -> char {
+    match (changed, deletion) {
+        (true, true) => '-',
+        (true, false) => '+',
+        (false, _) => ' ',
     }
 }
 
 fn diff_span_style(span: &DiffSpan, deletion: bool) -> Style {
-    let changed = span.change.is_changed();
-    let mut style = if changed {
-        changed_style(true, deletion)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
+    let mut style = Style::default().fg(Color::Gray);
 
+    if span.change.is_changed() {
+        style = style.bg(if deletion {
+            DELETION_TOKEN_BACKGROUND
+        } else {
+            ADDITION_TOKEN_BACKGROUND
+        });
+    }
     if matches!(span.change, StructuralChange::NovelWord) {
-        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        style = style.add_modifier(Modifier::BOLD);
     }
     style
+}
+
+fn gutter_numbers([old_line, new_line]: [Option<u32>; 2]) -> String {
+    let old = old_line.map_or_else(String::new, |line| line.to_string());
+    let new = new_line.map_or_else(String::new, |line| line.to_string());
+    format!("{old:>5} {new:>5} ")
+}
+
+fn gutter_marker_style(changed: bool, deletion: bool) -> Style {
+    if !changed {
+        return Style::default().fg(Color::DarkGray);
+    }
+    Style::default()
+        .fg(if deletion {
+            Color::LightRed
+        } else {
+            Color::LightGreen
+        })
+        .add_modifier(Modifier::BOLD)
+}
+
+fn gutter_number_style(changed: bool, deletion: bool) -> Style {
+    let color = if changed {
+        if deletion {
+            Color::LightRed
+        } else {
+            Color::LightGreen
+        }
+    } else {
+        Color::DarkGray
+    };
+    Style::default().fg(color).add_modifier(Modifier::DIM)
+}
+
+fn row_style(changed: bool, deletion: bool, selected: bool) -> Style {
+    let style = if changed {
+        Style::default().bg(if deletion {
+            DELETION_BACKGROUND
+        } else {
+            ADDITION_BACKGROUND
+        })
+    } else {
+        Style::default()
+    };
+    selected_style(style, selected)
 }
 
 fn selected_style(style: Style, selected: bool) -> Style {
@@ -415,12 +460,15 @@ mod tests {
         assert_eq!(source_prefix("text", 0), "");
     }
 
-    fn measured_content_width(rows: &[DiffRow], mode: DiffMode, selected: usize) -> usize {
+    fn measured_content_width(rows: &[DiffRow], mode: DiffMode, selected: Option<usize>) -> usize {
         let lines = rendered_diff_lines(rows, true, mode);
         lines
             .iter()
             .map(|line| match line {
-                RenderedDiffLine::Separator => split_separator_line().width(),
+                RenderedDiffLine::Separator => match mode {
+                    DiffMode::SideBySide => split_separator_line().width(),
+                    DiffMode::Unified => unified_separator_line().width(),
+                },
                 RenderedDiffLine::Row { row, .. } => {
                     let index = *row;
                     let row = &rows[index];
@@ -469,12 +517,12 @@ mod tests {
         let rows = line_diff_document(before, after).rows;
 
         for mode in [DiffMode::Unified, DiffMode::SideBySide] {
-            for selected in [usize::MAX, 0, rows.len() - 1] {
+            for selected in [None, Some(0), Some(rows.len() - 1)] {
                 let lines = rendered_diff_lines(&rows, true, mode);
                 assert_eq!(
                     rendered_content_width(&rows, &lines, mode),
                     measured_content_width(&rows, mode, selected),
-                    "{mode:?} / selected {selected}"
+                    "{mode:?} / selected {selected:?}"
                 );
             }
         }
@@ -486,17 +534,20 @@ mod tests {
         for (index, row) in rows.iter().enumerate() {
             assert_eq!(
                 unified_row_line_count(row),
-                unified_lines(index, row, usize::MAX).len()
+                unified_lines(index, row, None).len()
             );
         }
     }
 
     #[test]
     fn missing_split_side_is_not_selected() {
-        let missing = side_line(0, None, "", &[], false, true, 0);
-        assert_eq!(missing.spans[0].content, "    · ");
-        assert_eq!(missing.spans[0].style.fg, Some(Color::DarkGray));
-        assert!(missing.spans[0].style.add_modifier.contains(Modifier::DIM));
+        let missing = side_line(0, None, "", &[], false, true, Some(0));
+        assert_eq!(missing.spans[0].content, " ");
+        assert_eq!(missing.spans[1].content, "      ");
+        assert_eq!(missing.spans[1].style.fg, Some(Color::DarkGray));
+        assert!(missing.spans[1].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(missing.style.bg, None);
+        assert!(!missing.to_string().contains('·'));
         assert!(
             missing
                 .spans
@@ -504,7 +555,7 @@ mod tests {
                 .all(|span| span.style.bg != Some(SELECTION_BACKGROUND))
         );
 
-        let present = side_line(0, Some(1), "added", &[], true, false, 0);
+        let present = side_line(0, Some(1), "added", &[], true, false, Some(0));
         assert!(
             present
                 .spans
@@ -514,7 +565,17 @@ mod tests {
     }
 
     #[test]
-    fn only_changed_tokens_receive_diff_coloring() {
+    fn missing_line_uses_a_dense_visible_pattern() {
+        let line = missing_line(12);
+
+        assert_eq!(line.to_string(), "············");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Rgb(76, 82, 94)));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(line.spans[0].style.bg, None);
+    }
+
+    #[test]
+    fn row_and_token_styles_express_different_diff_detail() {
         let spans = vec![
             DiffSpan {
                 start: 0,
@@ -530,14 +591,20 @@ mod tests {
             },
         ];
 
-        let line = side_line(0, Some(1), "const new", &spans, true, false, usize::MAX);
-        assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
-        assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(line.spans.last().unwrap().style.fg, Some(Color::LightGreen));
+        let line = side_line(0, Some(1), "const new", &spans, true, false, None);
+        assert_eq!(line.style.bg, Some(ADDITION_BACKGROUND));
+        assert_eq!(line.spans[0].style.fg, Some(Color::LightGreen));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
+        assert_eq!(line.spans[2].style.bg, None);
+        assert_eq!(
+            line.spans.last().unwrap().style.bg,
+            Some(ADDITION_TOKEN_BACKGROUND)
+        );
     }
 
     #[test]
-    fn unified_view_does_not_underline_changed_words() {
+    fn unified_view_uses_token_background_without_text_decoration() {
         let spans = vec![DiffSpan {
             start: 0,
             end: 7,
@@ -546,8 +613,21 @@ mod tests {
         }];
 
         for (marker, deletion) in [('-', true), ('+', false)] {
-            let line = unified_line(0, Some(1), "changed", &spans, marker, deletion, usize::MAX);
-            let changed_word = &line.spans[1];
+            let (old_line, new_line) = if deletion {
+                (Some(1), None)
+            } else {
+                (None, Some(1))
+            };
+            let line = unified_line(
+                0,
+                [old_line, new_line],
+                "changed",
+                &spans,
+                marker,
+                deletion,
+                None,
+            );
+            let changed_word = &line.spans[2];
 
             assert!(
                 !changed_word
@@ -555,11 +635,18 @@ mod tests {
                     .add_modifier
                     .contains(Modifier::UNDERLINED)
             );
+            assert!(
+                !changed_word
+                    .style
+                    .add_modifier
+                    .contains(Modifier::CROSSED_OUT)
+            );
+            assert!(changed_word.style.bg.is_some());
         }
     }
 
     #[test]
-    fn unified_deletion_strikethrough_starts_after_indentation() {
+    fn changed_row_background_pads_to_the_viewport_width() {
         let text = "    removed";
         let spans = vec![DiffSpan {
             start: 0,
@@ -568,21 +655,17 @@ mod tests {
             highlight: StructuralHighlight::Normal,
         }];
 
-        let line = unified_line(0, Some(1), text, &spans, '-', true, usize::MAX);
+        let line = unified_line(0, [Some(1), None], text, &spans, '-', true, None);
+        let padded = pad_line_background(line, 40);
 
-        assert_eq!(line.spans[1].content, "    ");
+        assert_eq!(padded.style.bg, Some(DELETION_BACKGROUND));
+        assert_eq!(padded.width(), 40);
+        assert_eq!(padded.spans[2].content, text);
         assert!(
-            !line.spans[1]
-                .style
-                .add_modifier
-                .contains(Modifier::CROSSED_OUT)
-        );
-        assert_eq!(line.spans[2].content, "removed");
-        assert!(
-            line.spans[2]
-                .style
-                .add_modifier
-                .contains(Modifier::CROSSED_OUT)
+            padded
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::CROSSED_OUT))
         );
     }
 
@@ -660,5 +743,24 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unified_view_separates_distant_change_hunks() {
+        let rows = line_diff_document(
+            "same\nold one\nbetween\nold two\nend\n",
+            "same\nnew one\nbetween\nnew two\nend\n",
+        )
+        .rows;
+
+        let rendered = rendered_diff_lines(&rows, false, DiffMode::Unified);
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| matches!(line, RenderedDiffLine::Separator))
+                .count(),
+            1
+        );
+        assert_eq!(unified_separator_line().width(), UNIFIED_SEPARATOR_WIDTH);
     }
 }

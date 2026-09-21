@@ -11,6 +11,7 @@ struct TreeNode {
 #[derive(Clone)]
 pub(crate) struct TreeRow {
     pub(crate) path: String,
+    pub(crate) label: String,
     pub(crate) depth: usize,
     pub(crate) file_index: Option<usize>,
     pub(crate) expanded: bool,
@@ -40,21 +41,50 @@ fn flatten_tree(
     rows: &mut Vec<TreeRow>,
 ) {
     for (name, child) in &node.children {
-        let path = if prefix.is_empty() {
+        let mut path = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{prefix}/{name}")
         };
-        let is_directory = !child.children.is_empty();
-        let expanded = is_directory && !collapsed_dirs.contains(&path);
-        rows.push(TreeRow {
-            path: path.clone(),
-            depth,
-            file_index: child.file_index,
-            expanded,
-        });
-        if is_directory && expanded {
-            flatten_tree(child, &path, depth + 1, collapsed_dirs, rows);
+        let mut label = name.clone();
+        let mut current = child;
+
+        loop {
+            let is_directory = !current.children.is_empty();
+            if !is_directory || collapsed_dirs.contains(&path) {
+                rows.push(TreeRow {
+                    path,
+                    label,
+                    depth,
+                    file_index: current.file_index,
+                    expanded: false,
+                });
+                break;
+            }
+
+            if current.file_index.is_none() && current.children.len() == 1 {
+                let (next_name, next) = current
+                    .children
+                    .iter()
+                    .next()
+                    .expect("single-child directory has a child");
+                path.push('/');
+                path.push_str(next_name);
+                label.push('/');
+                label.push_str(next_name);
+                current = next;
+                continue;
+            }
+
+            rows.push(TreeRow {
+                path: path.clone(),
+                label,
+                depth,
+                file_index: current.file_index,
+                expanded: true,
+            });
+            flatten_tree(current, &path, depth + 1, collapsed_dirs, rows);
+            break;
         }
     }
 }
@@ -83,19 +113,67 @@ mod tests {
     use super::*;
     #[test]
     fn changed_tree_hides_collapsed_descendants() {
-        let files = vec![FileItem {
-            path: "src/main.rs".into(),
-            status: " M".into(),
-        }];
+        let files = ["src/main.rs", "src/lib.rs"]
+            .into_iter()
+            .map(|path| FileItem {
+                path: path.into(),
+                status: " M".into(),
+            })
+            .collect::<Vec<_>>();
         let expanded = file_tree_rows(&files, &BTreeSet::new());
-        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded.len(), 3);
         assert!(expanded[0].expanded);
-        assert_eq!(expanded[1].path, "src/main.rs");
-        assert_eq!(expanded[1].file_index, Some(0));
+        assert_eq!(expanded[1].path, "src/lib.rs");
+        assert_eq!(expanded[1].file_index, Some(1));
 
         let collapsed = file_tree_rows(&files, &BTreeSet::from(["src".to_owned()]));
         assert_eq!(collapsed.len(), 1);
         assert!(!collapsed[0].expanded);
+    }
+
+    #[test]
+    fn changed_tree_compacts_a_single_file_path_into_one_row() {
+        let files = vec![FileItem {
+            path: "packages/business/src/services/finance/payroll-journal/examples/report.json"
+                .into(),
+            status: "??".into(),
+        }];
+
+        let rows = file_tree_rows(&files, &BTreeSet::new());
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, files[0].path);
+        assert_eq!(rows[0].label, files[0].path);
+        assert_eq!(rows[0].file_index, Some(0));
+    }
+
+    #[test]
+    fn changed_tree_compacts_single_child_paths_around_a_branch() {
+        let files = [
+            "packages/business/src/main.rs",
+            "packages/business/tests/main.rs",
+        ]
+        .into_iter()
+        .map(|path| FileItem {
+            path: path.into(),
+            status: " M".into(),
+        })
+        .collect::<Vec<_>>();
+
+        let rows = file_tree_rows(&files, &BTreeSet::new());
+        let labels = rows
+            .iter()
+            .map(|row| (row.label.as_str(), row.depth, row.file_index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                ("packages/business", 0, None),
+                ("src/main.rs", 1, Some(0)),
+                ("tests/main.rs", 1, Some(1)),
+            ]
+        );
     }
 
     #[test]

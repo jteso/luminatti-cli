@@ -64,6 +64,7 @@ pub(super) fn move_diff_selection(app: &mut App, down: bool, viewport_height: u1
         return;
     };
     app.selected_row = next_index;
+    app.diff_selection_active = true;
     scroll_diff_selection_into_view(app, viewport_height);
 }
 
@@ -104,6 +105,7 @@ pub(super) fn move_change_selection(
 
     if let Some(target) = adjacent_changed_row(&app.diff_rows, app.selected_row, forward) {
         app.selected_row = target;
+        app.diff_selection_active = true;
         scroll_diff_selection_into_view(app, viewport_height);
         return Ok(());
     }

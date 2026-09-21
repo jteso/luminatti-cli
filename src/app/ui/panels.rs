@@ -15,7 +15,6 @@ pub(super) fn draw_files(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let items: Vec<_> = tree_rows
         .iter()
         .map(|row| {
-            let name = row.path.rsplit('/').next().unwrap_or(&row.path);
             let indent = "  ".repeat(row.depth);
             if let Some(file_index) = row.file_index {
                 let file = &app.files[file_index];
@@ -25,7 +24,7 @@ pub(super) fn draw_files(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                         format!("{} ", file.status.trim()),
                         Style::default().fg(Color::Yellow),
                     ),
-                    Span::raw(name.to_owned()),
+                    Span::raw(row.label.clone()),
                 ]))
             } else {
                 ListItem::new(Line::from(vec![
@@ -34,7 +33,7 @@ pub(super) fn draw_files(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                         accent_style(),
                     ),
                     Span::styled(
-                        name.to_owned(),
+                        row.label.clone(),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                 ]))
@@ -142,7 +141,7 @@ pub(super) fn draw_comments(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         })
         .collect();
     let list = List::new(items)
-        .block(right_panel_block(app, false, true))
+        .block(right_panel_block(app, false, true, area.width))
         .highlight_style(selected_row_style());
     let mut state = ratatui::widgets::ListState::default();
     state.select((!comments.is_empty()).then_some(app.selected_comment));

@@ -47,7 +47,8 @@ panel. `[`/`]` move to the previous/next changed row, crossing into the adjacent
 changed file at file boundaries; `{`/`}` jump directly to the previous/next
 changed file. `f` focuses Files, `u` selects unified view,
 and `s` selects split view. In Changes, `Left`/`Right` scroll code horizontally;
-split columns share one offset and move together. In the focused Comments tab,
+split columns share one offset and move together. `Esc` clears the selected diff
+line while keeping it as the navigation anchor. In the focused Comments tab,
 `d` deletes the selected local comment and `D` deletes all local comments;
 the latter asks for `Enter` confirmation and accepts `Esc` to cancel.
 Agent-provided comments remain read-only.

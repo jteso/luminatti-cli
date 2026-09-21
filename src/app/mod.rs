@@ -41,6 +41,16 @@ pub(crate) fn run(repo: PathBuf) -> Result<()> {
 }
 
 const SCROLLBAR_VISIBILITY_DURATION: Duration = Duration::from_secs(3);
+const CURSOR_BLINK_MILLIS: u128 = 530;
+
+/// Whether the block cursor should currently be drawn, toggling over time.
+pub(crate) fn cursor_blink_visible() -> bool {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    (millis / CURSOR_BLINK_MILLIS).is_multiple_of(2)
+}
 
 type RefreshWorker = worker::Worker<(), Result<(Vec<FileItem>, RemoteStatus)>>;
 
@@ -100,6 +110,7 @@ struct App {
     selected_ignored: usize,
     selected_comment: usize,
     selected_row: usize,
+    diff_selection_active: bool,
     collapsed_dirs: BTreeSet<String>,
     divider: u16,
     dragging_divider: bool,
@@ -153,6 +164,7 @@ impl App {
             selected_ignored: 0,
             selected_comment: 0,
             selected_row: 0,
+            diff_selection_active: false,
             collapsed_dirs: BTreeSet::new(),
             divider: settings.divider,
             dragging_divider: false,

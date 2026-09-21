@@ -1,9 +1,11 @@
-use super::super::{App, Input, InputKind};
-use super::widgets::{accent_style, render_vertical_scrollbar, rounded_block, selected_row_style};
-use crate::search::fuzzy_file_indices;
+use super::super::{App, Input, InputKind, cursor_blink_visible};
+use super::widgets::{
+    accent_style, render_vertical_scrollbar, rounded_block, selected_row_background,
+};
+use crate::search::ranked_matches;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Borders, Clear, List, ListItem, Paragraph},
 };
@@ -76,6 +78,7 @@ pub(super) fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         help_binding("h", "toggle final version in unified view"),
         help_binding("i", "show or hide common lines"),
         help_binding("c", "add review comment"),
+        help_binding("Esc", "clear line selection"),
         Line::default(),
         help_heading("COMMENTS"),
         help_binding("y", "copy selected comment JSON"),
@@ -106,8 +109,17 @@ pub(super) fn draw_input(frame: &mut ratatui::Frame, input: &Input, area: Rect) 
         InputKind::Filter => (" Exclude Glob... ", "Save filter"),
         InputKind::FileSearch => unreachable!("file search has its own dialog"),
     };
+    let mut spans = vec![Span::raw(" "), Span::raw(input.value.clone())];
+    if cursor_blink_visible() {
+        spans.push(Span::styled(
+            " ",
+            Style::default()
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(input.value.as_str()).block(
+        Paragraph::new(Line::from(spans)).block(
             rounded_block()
                 .borders(Borders::ALL)
                 .border_style(accent_style())
@@ -141,6 +153,26 @@ pub(super) fn draw_delete_all_confirmation(frame: &mut ratatui::Frame, area: Rec
     );
 }
 
+/// Builds a path line with the matched characters accented.
+fn file_path_line(path: &str, positions: &[usize]) -> Line<'static> {
+    let matched = positions
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut spans = vec![Span::raw("  ")];
+    for (char_index, character) in path.chars().enumerate() {
+        let style = if matched.contains(&char_index) {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(character.to_string(), style));
+    }
+    Line::from(spans)
+}
+
 fn centered_popup(area: Rect, requested_width: u16, requested_height: u16) -> Rect {
     let width = requested_width.min(area.width.saturating_sub(2)).max(1);
     let height = requested_height.min(area.height.saturating_sub(2)).max(1);
@@ -153,8 +185,8 @@ fn centered_popup(area: Rect, requested_width: u16, requested_height: u16) -> Re
 }
 
 pub(super) fn draw_file_search(frame: &mut ratatui::Frame, app: &App, input: &Input, area: Rect) {
-    let matches = fuzzy_file_indices(&app.files, &input.value);
-    let height = (matches.len().min(11) as u16).saturating_add(3).max(5);
+    let match_count = ranked_matches(&app.files, &input.value).len();
+    let height = (match_count.min(11) as u16).saturating_add(3).max(5);
     let popup = centered_popup(area, area.width.saturating_mul(3) / 4, height);
     frame.render_widget(Clear, popup);
 
@@ -172,13 +204,18 @@ pub(super) fn draw_file_search(frame: &mut ratatui::Frame, app: &App, input: &In
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("/ ", accent_style()),
-            Span::raw(input.value.clone()),
-        ])),
-        sections[0],
-    );
+    let mut prompt = vec![Span::raw(" "), Span::raw(input.value.clone())];
+    if cursor_blink_visible() {
+        prompt.push(Span::styled(
+            " ",
+            Style::default()
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(prompt)), sections[0]);
+    let matches = ranked_matches(&app.files, &input.value);
+    let selected = (!matches.is_empty()).then(|| input.selected.min(matches.len() - 1));
     let items = if matches.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  No matching files",
@@ -187,14 +224,16 @@ pub(super) fn draw_file_search(frame: &mut ratatui::Frame, app: &App, input: &In
     } else {
         matches
             .iter()
-            .map(|index| ListItem::new(format!("  {}", app.files[*index].path)))
+            .map(|(index, positions)| {
+                ListItem::new(file_path_line(&app.files[*index].path, positions))
+            })
             .collect::<Vec<_>>()
     };
     let mut state = ratatui::widgets::ListState::default();
-    state.select((!matches.is_empty()).then(|| input.selected.min(matches.len() - 1)));
+    state.select(selected);
     frame.render_stateful_widget(
         List::new(items)
-            .highlight_style(selected_row_style())
+            .highlight_style(selected_row_background())
             .highlight_symbol("›"),
         sections[1],
         &mut state,
@@ -202,7 +241,7 @@ pub(super) fn draw_file_search(frame: &mut ratatui::Frame, app: &App, input: &In
     render_vertical_scrollbar(
         frame,
         popup,
-        matches.len(),
+        match_count,
         sections[1].height as usize,
         state.offset(),
         app.scrollbars_visible(),
@@ -254,6 +293,7 @@ mod tests {
         assert!(contents.contains("s  show split view"));
         assert!(contents.contains("u  show unified view"));
         assert!(contents.contains("h  toggle final version in unified view"));
+        assert!(contents.contains("Esc  clear line selection"));
         assert!(contents.contains("d  remove comment"));
         assert!(contents.contains("D  remove all comments"));
         assert!(!contents.contains("f / l"));
@@ -387,5 +427,73 @@ mod tests {
         assert!(top_border.contains("Open File..."));
         assert!(!top_border.contains("Enter opens"));
         assert!(bottom_border.ends_with(" [ENTER] Open   [ESC] Close ╯"));
+    }
+
+    #[test]
+    fn file_search_prompt_omits_slash_prefix() {
+        let mut app = preview_app("before\n", "after\n");
+        app.files = vec![FileItem {
+            path: "src/main.rs".into(),
+            status: " M".into(),
+        }];
+        let input = Input {
+            kind: InputKind::FileSearch,
+            value: "main".into(),
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        terminal
+            .draw(|frame| draw_file_search(frame, &app, &input, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let prompt = (0..buffer.area.width)
+            .map(|x| buffer[(x, 8)].symbol())
+            .collect::<String>();
+        assert!(prompt.contains(" main"));
+        assert!(!prompt.contains("/ main"));
+        let matches = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .any(|line| line.contains("src/main.rs"));
+        assert!(matches);
+    }
+
+    #[test]
+    fn file_search_highlights_matched_characters_in_paths() {
+        let mut app = preview_app("before\n", "after\n");
+        app.files = vec![FileItem {
+            path: "src/main.rs".into(),
+            status: " M".into(),
+        }];
+        let input = Input {
+            kind: InputKind::FileSearch,
+            value: "sr".into(),
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        terminal
+            .draw(|frame| draw_file_search(frame, &app, &input, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut found = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "s"
+                    && cell.fg == Color::Magenta
+                    && cell.modifier.contains(Modifier::BOLD)
+                {
+                    found = true;
+                }
+            }
+        }
+        assert!(found);
     }
 }

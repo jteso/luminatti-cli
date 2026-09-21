@@ -6,6 +6,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+const SYNC_STATUS_COLOR: Color = Color::Rgb(202, 170, 92);
+
 pub(super) fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let area = area.inner(Margin {
         vertical: 0,
@@ -48,7 +50,7 @@ fn push_shortcut_display(
     spans.push(Span::styled(
         display.into(),
         Style::default()
-            .fg(Color::Yellow)
+            .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(
@@ -76,9 +78,7 @@ fn remote_status_line(app: &App) -> Line<'static> {
         .and_then(|name| name.to_str())
         .unwrap_or("git");
     let white = Style::default().fg(Color::White);
-    let yellow = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let sync_status = Style::default().fg(SYNC_STATUS_COLOR);
     let mut spans = vec![
         Span::styled(project.to_owned(), white.add_modifier(Modifier::BOLD)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
@@ -87,17 +87,52 @@ fn remote_status_line(app: &App) -> Line<'static> {
     match (app.remote.behind, app.remote.ahead) {
         (Some(behind), Some(ahead)) => {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled("↓", yellow));
-            spans.push(Span::styled(behind.to_string(), white));
+            spans.push(Span::styled("↓", sync_status));
+            spans.push(Span::styled(behind.to_string(), sync_status));
             spans.push(Span::raw(" "));
-            spans.push(Span::styled("↑", yellow));
-            spans.push(Span::styled(ahead.to_string(), white));
+            spans.push(Span::styled("↑", sync_status));
+            spans.push(Span::styled(ahead.to_string(), sync_status));
         }
         _ => {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled("◆", yellow));
+            spans.push(Span::styled("◆", sync_status));
             spans.push(Span::styled(" no upstream", white));
         }
     }
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::preview_app;
+
+    #[test]
+    fn sync_arrows_and_counts_use_muted_yellow() {
+        let mut app = preview_app("before\n", "after\n");
+        app.remote.behind = Some(0);
+        app.remote.ahead = Some(1);
+
+        let line = remote_status_line(&app);
+        let muted_yellow = Some(Color::Rgb(202, 170, 92));
+
+        for span in [
+            &line.spans[4],
+            &line.spans[5],
+            &line.spans[7],
+            &line.spans[8],
+        ] {
+            assert_eq!(span.style.fg, muted_yellow);
+            assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn permanent_shortcut_tokens_are_white() {
+        let line = permanent_shortcut_line();
+
+        for span in [&line.spans[0], &line.spans[3], &line.spans[6]] {
+            assert_eq!(span.style.fg, Some(Color::White));
+        }
+    }
 }

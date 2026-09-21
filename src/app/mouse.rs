@@ -93,6 +93,7 @@ pub(super) fn handle_mouse(
                         clicked_row_index(app, mouse.row, terminal_width, terminal_height)
                     {
                         app.selected_row = index;
+                        app.diff_selection_active = true;
                     }
                 } else {
                     let index = mouse.row.saturating_sub(1) as usize;
@@ -175,6 +176,7 @@ fn handle_maximized_mouse(
                     clicked_row_index(app, mouse.row, terminal_width, terminal_height)
                 {
                     app.selected_row = index;
+                    app.diff_selection_active = true;
                 }
             }
             Focus::Right => {

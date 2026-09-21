@@ -2,7 +2,7 @@ use super::super::{Focus, keyboard::handle_key, test_support::preview_app};
 use super::widgets::panel_block;
 use super::*;
 use crate::diff::line_diff_document;
-use crate::diff_view::DiffMode;
+use crate::diff_view::{DiffMode, SELECTION_BACKGROUND};
 use crossterm::event::KeyCode;
 use ratatui::{
     Terminal,
@@ -61,6 +61,28 @@ fn panel_tabs_render_in_the_top_border_with_purple_accents() {
 }
 
 #[test]
+fn files_panel_renders_a_single_file_as_its_compacted_path() {
+    let mut app = preview_app("before\n", "after\n");
+    app.files = vec![crate::git::FileItem {
+        path: "packages/business/src/services/finance/payroll-journal/examples/report.json".into(),
+        status: "??".into(),
+    }];
+    let mut terminal = Terminal::new(TestBackend::new(90, 3)).unwrap();
+
+    terminal
+        .draw(|frame| draw_files(frame, &app, frame.area()))
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let file_row = (0..buffer.area.width)
+        .map(|x| buffer[(x, 1)].symbol())
+        .collect::<String>();
+    assert!(file_row.contains(
+        "?? packages/business/src/services/finance/payroll-journal/examples/report.json"
+    ));
+}
+
+#[test]
 fn footer_keeps_status_left_and_permanent_shortcuts_right() {
     let mut app = preview_app("before\n", "after\n");
     app.repo = PathBuf::from("/tmp/luminatti-cli");
@@ -78,7 +100,7 @@ fn footer_keeps_status_left_and_permanent_shortcuts_right() {
     assert!(footer.starts_with(" luminatti-cli · main"));
     assert!(footer.ends_with("[/] Search  [?] Help  [q] Quit "));
     assert!(!footer.contains("find file"));
-    assert_eq!(buffer[(69, 0)].fg, Color::Yellow);
+    assert_eq!(buffer[(69, 0)].fg, Color::White);
 }
 
 #[test]
@@ -118,10 +140,57 @@ fn horizontal_scroll_moves_both_split_columns_together() {
         .unwrap();
     let buffer = terminal.backend().buffer();
 
-    assert_eq!(buffer[(1, 1)].symbol(), "s");
-    assert_eq!(buffer[(26, 1)].symbol(), "s");
+    assert_eq!(buffer[(2, 1)].symbol(), "s");
+    assert_eq!(buffer[(27, 1)].symbol(), "s");
+    assert_eq!(buffer[(24, 1)].bg, SELECTION_BACKGROUND);
     assert!((1..49).any(|x| buffer[(x, 7)].symbol() == "━"));
     assert_eq!(buffer[(49, 1)].fg, Color::Magenta);
+}
+
+#[test]
+fn escape_clears_the_diff_line_selection() {
+    let mut app = preview_app("old\n", "new\n");
+    app.diff_mode = DiffMode::SideBySide;
+    let mut terminal = Terminal::new(TestBackend::new(50, 4)).unwrap();
+
+    terminal
+        .draw(|frame| draw_diff(frame, &app, frame.area()))
+        .unwrap();
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.bg == SELECTION_BACKGROUND)
+    );
+
+    handle_key(&mut app, KeyCode::Esc, 50, 4).unwrap();
+    terminal
+        .draw(|frame| draw_diff(frame, &app, frame.area()))
+        .unwrap();
+
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.bg != SELECTION_BACKGROUND)
+    );
+
+    handle_key(&mut app, KeyCode::Down, 50, 4).unwrap();
+    terminal
+        .draw(|frame| draw_diff(frame, &app, frame.area()))
+        .unwrap();
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.bg == SELECTION_BACKGROUND)
+    );
 }
 
 #[test]
@@ -201,11 +270,13 @@ fn unified_rows_render_each_physical_line_exactly_once() {
 fn unified_occurrence_selects_the_right_physical_line() {
     use crate::diff_view::unified_occurrence_line;
     let rows = crate::diff::line_diff_document("old\n", "new\n").rows;
-    let deletion = unified_occurrence_line(0, &rows[0], 0, usize::MAX, usize::MAX).unwrap();
-    let insertion = unified_occurrence_line(0, &rows[0], 1, usize::MAX, usize::MAX).unwrap();
-    assert_eq!(deletion.spans[0].content, "-      ");
-    assert_eq!(insertion.spans[0].content, "+    1 ");
-    assert!(unified_occurrence_line(0, &rows[0], 2, usize::MAX, usize::MAX).is_none());
+    let deletion = unified_occurrence_line(0, &rows[0], 0, None, usize::MAX).unwrap();
+    let insertion = unified_occurrence_line(0, &rows[0], 1, None, usize::MAX).unwrap();
+    assert_eq!(deletion.spans[0].content, "-");
+    assert_eq!(deletion.spans[1].content, "    1       ");
+    assert_eq!(insertion.spans[0].content, "+");
+    assert_eq!(insertion.spans[1].content, "          1 ");
+    assert!(unified_occurrence_line(0, &rows[0], 2, None, usize::MAX).is_none());
 }
 #[test]
 fn very_long_source_lines_do_not_block_drawing() {

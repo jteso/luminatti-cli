@@ -6,7 +6,10 @@ use super::{
 };
 use crate::{
     diff::{DiffRow, line_diff_document, source_document, structural_diff_document},
-    diff_view::{DiffMode, RenderedDiffLine, rendered_content_width, rendered_diff_lines},
+    diff_view::{
+        DiffMode, RenderedDiffLine, rendered_content_width, rendered_diff_lines,
+        rendered_source_content_width,
+    },
     git::{git_show_head_file, head_commit},
 };
 use anyhow::Result;
@@ -175,7 +178,11 @@ impl DiffRenderState {
     fn new(key: DiffRenderKey, rows: &[DiffRow]) -> Self {
         let lines = rendered_diff_lines(rows, key.final_view || key.show_unchanged, key.mode);
         let indices = dedupe_row_indices(&lines);
-        let content_width = rendered_content_width(rows, &lines, key.mode);
+        let content_width = if key.final_view {
+            rendered_source_content_width(rows, &lines)
+        } else {
+            rendered_content_width(rows, &lines, key.mode)
+        };
         Self {
             key,
             lines,
@@ -301,6 +308,7 @@ impl App {
         self.final_origin = None;
         self.diff_scroll = 0;
         self.diff_horizontal_scroll = 0;
+        self.diff_selection_active = true;
         true
     }
 
@@ -313,6 +321,7 @@ impl App {
         self.diff_language.clear();
         self.diff_has_syntactic_changes = false;
         self.selected_row = 0;
+        self.diff_selection_active = false;
         self.diff_scroll = 0;
         self.diff_horizontal_scroll = 0;
         self.diff_signature = None;
