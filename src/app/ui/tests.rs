@@ -61,25 +61,29 @@ fn panel_tabs_render_in_the_top_border_with_purple_accents() {
 }
 
 #[test]
-fn files_panel_renders_a_single_file_as_its_compacted_path() {
+fn files_panel_renders_a_single_file_below_its_compacted_directory_path() {
     let mut app = preview_app("before\n", "after\n");
     app.files = vec![crate::git::FileItem {
         path: "packages/business/src/services/finance/payroll-journal/examples/report.json".into(),
         status: "??".into(),
     }];
-    let mut terminal = Terminal::new(TestBackend::new(90, 3)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(90, 4)).unwrap();
 
     terminal
         .draw(|frame| draw_files(frame, &app, frame.area()))
         .unwrap();
 
     let buffer = terminal.backend().buffer();
-    let file_row = (0..buffer.area.width)
+    let directory_row = (0..buffer.area.width)
         .map(|x| buffer[(x, 1)].symbol())
         .collect::<String>();
-    assert!(file_row.contains(
-        "?? packages/business/src/services/finance/payroll-journal/examples/report.json"
-    ));
+    let file_row = (0..buffer.area.width)
+        .map(|x| buffer[(x, 2)].symbol())
+        .collect::<String>();
+    assert!(
+        directory_row.contains("packages/business/src/services/finance/payroll-journal/examples")
+    );
+    assert!(file_row.contains("?? report.json"));
 }
 
 #[test]

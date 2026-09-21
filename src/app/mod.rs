@@ -71,6 +71,11 @@ enum Focus {
     Filters,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveFileList {
+    Changed,
+    Ignored,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputKind {
     Comment,
     Filter,
@@ -108,6 +113,7 @@ struct App {
     selected_file: usize,
     selected_filter: usize,
     selected_ignored: usize,
+    active_file_list: ActiveFileList,
     selected_comment: usize,
     selected_row: usize,
     diff_selection_active: bool,
@@ -162,6 +168,7 @@ impl App {
             selected_file: 0,
             selected_filter: 0,
             selected_ignored: 0,
+            active_file_list: ActiveFileList::Changed,
             selected_comment: 0,
             selected_row: 0,
             diff_selection_active: false,
@@ -244,6 +251,7 @@ impl App {
         self.refresh_pending = false;
         let (files, remote) = result?;
         let previous_path = self.active_path().map(str::to_owned);
+        let previous_file_list = self.active_file_list;
         let filter = compile_filters(&self.filters.patterns)?;
         let (ignored_files, files) = partition_filtered_files(files, &filter);
         self.files = files;
@@ -251,13 +259,25 @@ impl App {
         self.selected_file = self
             .selected_file
             .min(self.file_tree_rows().len().saturating_sub(1));
-        if let Some(path) = previous_path
-            && let Some(index) = self
-                .file_tree_rows()
-                .iter()
-                .position(|row| row.path == path)
-        {
-            self.selected_file = index;
+        if let Some(path) = previous_path {
+            match previous_file_list {
+                ActiveFileList::Changed => {
+                    if let Some(index) = self
+                        .file_tree_rows()
+                        .iter()
+                        .position(|row| row.path == path)
+                    {
+                        self.selected_file = index;
+                    }
+                }
+                ActiveFileList::Ignored => {
+                    if let Some(index) =
+                        self.ignored_files.iter().position(|file| file.path == path)
+                    {
+                        self.selected_ignored = index;
+                    }
+                }
+            }
         }
         self.selected_filter = self
             .selected_filter

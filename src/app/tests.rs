@@ -66,6 +66,55 @@ fn arrow_keys_move_only_the_focused_list_and_stop_at_its_boundaries() {
 }
 
 #[test]
+fn clicking_an_ignored_file_loads_its_diff_and_brace_navigation_stays_ignored() {
+    use std::fs;
+
+    let repo = std::env::temp_dir().join(format!("luminatti-ignored-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("visible.txt"), "visible\n").unwrap();
+    fs::write(repo.join("ignored-a.txt"), "ignored a\n").unwrap();
+    fs::write(repo.join("ignored-b.txt"), "ignored b\n").unwrap();
+
+    let mut app = preview_app("", "");
+    app.repo = repo.clone();
+    app.files = vec![FileItem {
+        path: "visible.txt".into(),
+        status: "??".into(),
+    }];
+    app.ignored_files = ["ignored-a.txt", "ignored-b.txt"]
+        .into_iter()
+        .map(|path| FileItem {
+            path: path.into(),
+            status: "??".into(),
+        })
+        .collect();
+    app.filter_tab = FilterTab::Ignored;
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 16,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        100,
+        20,
+    )
+    .unwrap();
+    test_support::wait_for_diff(&mut app);
+    assert_eq!(app.active_diff_path.as_deref(), Some("ignored-a.txt"));
+    assert_eq!(app.diff_rows[0].new_text, "ignored a");
+
+    handle_key(&mut app, KeyCode::Char('}'), 100, 20).unwrap();
+    test_support::wait_for_diff(&mut app);
+    assert_eq!(app.active_diff_path.as_deref(), Some("ignored-b.txt"));
+    assert_eq!(app.diff_rows[0].new_text, "ignored b");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn final_toggle_shows_complete_source_and_restores_deleted_selection() {
     let mut app = preview_app("first\nremoved\nlast\n", "first\nlast\n");
     app.selected_row = app

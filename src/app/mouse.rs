@@ -59,6 +59,7 @@ pub(super) fn handle_mouse(
                         mouse.row.saturating_sub(left_panels[0].y.saturating_add(1)) as usize;
                     let tree_rows = app.file_tree_rows();
                     app.selected_file = index.min(tree_rows.len().saturating_sub(1));
+                    app.active_file_list = super::ActiveFileList::Changed;
                     if tree_rows
                         .get(app.selected_file)
                         .and_then(|row| row.file_index)
@@ -83,7 +84,9 @@ pub(super) fn handle_mouse(
                         app.selected_filter =
                             index.min(app.filters.patterns.len().saturating_sub(1));
                     } else {
-                        app.selected_ignored = index.min(app.ignored_files.len().saturating_sub(1));
+                        app.activate_ignored_file(
+                            index.min(app.ignored_files.len().saturating_sub(1)),
+                        )?;
                     }
                 }
             } else {
@@ -141,6 +144,7 @@ fn handle_maximized_mouse(
                 let index = mouse.row.saturating_sub(1) as usize;
                 let tree_rows = app.file_tree_rows();
                 app.selected_file = index.min(tree_rows.len().saturating_sub(1));
+                app.active_file_list = super::ActiveFileList::Changed;
                 if tree_rows
                     .get(app.selected_file)
                     .and_then(|row| row.file_index)
@@ -161,7 +165,9 @@ fn handle_maximized_mouse(
                 if app.filter_tab == FilterTab::Filters {
                     app.selected_filter = index.min(app.filters.patterns.len().saturating_sub(1));
                 } else {
-                    app.selected_ignored = index.min(app.ignored_files.len().saturating_sub(1));
+                    app.activate_ignored_file(
+                        index.min(app.ignored_files.len().saturating_sub(1)),
+                    )?;
                 }
             }
             Focus::Right if mouse.row == 0 => {

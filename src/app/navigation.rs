@@ -1,6 +1,6 @@
 //! Selection movement and scroll bounds independent of input devices.
 use super::diff::selected_line_position;
-use super::{App, Focus, RightTab, layout::max_diff_horizontal_scroll};
+use super::{ActiveFileList, App, Focus, RightTab, layout::max_diff_horizontal_scroll};
 use crate::{
     diff::{DiffRow, adjacent_changed_row},
     file_tree::adjacent_file_index,
@@ -110,25 +110,31 @@ pub(super) fn move_change_selection(
         return Ok(());
     }
 
-    let current_file = app.active_file_index();
-    if let Some(file_index) = adjacent_file_index(&app.files, current_file, forward) {
-        app.select_file(file_index)?;
+    let previous_path = app.active_path().map(str::to_owned);
+    move_file_selection(app, forward)?;
+    if app.active_path() != previous_path.as_deref() {
         app.select_last_change = !forward;
-    } else {
-        app.message = if forward {
-            "already at the last changed file"
-        } else {
-            "already at the first changed file"
-        }
-        .into();
     }
     Ok(())
 }
 
 pub(super) fn move_file_selection(app: &mut App, forward: bool) -> Result<()> {
-    let current_file = app.active_file_index();
-    if let Some(file_index) = adjacent_file_index(&app.files, current_file, forward) {
-        app.select_file(file_index)?;
+    let file_list = app.active_file_list;
+    let file_index = match file_list {
+        ActiveFileList::Changed => {
+            adjacent_file_index(&app.files, app.active_file_index(), forward)
+        }
+        ActiveFileList::Ignored => adjacent_file_index(
+            &app.ignored_files,
+            (!app.ignored_files.is_empty()).then_some(app.selected_ignored),
+            forward,
+        ),
+    };
+    if let Some(file_index) = file_index {
+        match file_list {
+            ActiveFileList::Changed => app.select_file(file_index)?,
+            ActiveFileList::Ignored => app.select_ignored_file(file_index)?,
+        }
     } else {
         app.message = if forward {
             "already at the last changed file"

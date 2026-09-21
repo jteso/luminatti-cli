@@ -36,6 +36,7 @@ pub(super) fn preview_app(before: &str, after: &str) -> App {
         selected_file: 0,
         selected_filter: 0,
         selected_ignored: 0,
+        active_file_list: ActiveFileList::Changed,
         selected_comment: 0,
         selected_row: 0,
         diff_selection_active: true,

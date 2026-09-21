@@ -68,12 +68,15 @@ fn flatten_tree(
                     .iter()
                     .next()
                     .expect("single-child directory has a child");
-                path.push('/');
-                path.push_str(next_name);
-                label.push('/');
-                label.push_str(next_name);
-                current = next;
-                continue;
+
+                if !next.children.is_empty() {
+                    path.push('/');
+                    path.push_str(next_name);
+                    label.push('/');
+                    label.push_str(next_name);
+                    current = next;
+                    continue;
+                }
             }
 
             rows.push(TreeRow {
@@ -132,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_tree_compacts_a_single_file_path_into_one_row() {
+    fn changed_tree_keeps_a_file_separate_from_its_compacted_parent_directory() {
         let files = vec![FileItem {
             path: "packages/business/src/services/finance/payroll-journal/examples/report.json"
                 .into(),
@@ -141,14 +144,27 @@ mod tests {
 
         let rows = file_tree_rows(&files, &BTreeSet::new());
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].path, files[0].path);
-        assert_eq!(rows[0].label, files[0].path);
-        assert_eq!(rows[0].file_index, Some(0));
+        let labels = rows
+            .iter()
+            .map(|row| (row.label.as_str(), row.depth, row.file_index, row.expanded))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                (
+                    "packages/business/src/services/finance/payroll-journal/examples",
+                    0,
+                    None,
+                    true,
+                ),
+                ("report.json", 1, Some(0), false),
+            ]
+        );
     }
 
     #[test]
-    fn changed_tree_compacts_single_child_paths_around_a_branch() {
+    fn changed_tree_compacts_directory_paths_around_a_branch() {
         let files = [
             "packages/business/src/main.rs",
             "packages/business/tests/main.rs",
@@ -170,8 +186,44 @@ mod tests {
             labels,
             vec![
                 ("packages/business", 0, None),
-                ("src/main.rs", 1, Some(0)),
-                ("tests/main.rs", 1, Some(1)),
+                ("src", 1, None),
+                ("main.rs", 2, Some(0)),
+                ("tests", 1, None),
+                ("main.rs", 2, Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_tree_keeps_single_file_child_directories_expanded_at_a_branch() {
+        let files = [
+            "internal/mapping/countries/au/map.ts",
+            "internal/mapping/countries/hk/map.ts",
+            "internal/mapping/countries/in/map.ts",
+        ]
+        .into_iter()
+        .map(|path| FileItem {
+            path: path.into(),
+            status: " M".into(),
+        })
+        .collect::<Vec<_>>();
+
+        let rows = file_tree_rows(&files, &BTreeSet::new());
+        let labels = rows
+            .iter()
+            .map(|row| (row.label.as_str(), row.depth, row.file_index, row.expanded))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                ("internal/mapping/countries", 0, None, true),
+                ("au", 1, None, true),
+                ("map.ts", 2, Some(0), false),
+                ("hk", 1, None, true),
+                ("map.ts", 2, Some(1), false),
+                ("in", 1, None, true),
+                ("map.ts", 2, Some(2), false),
             ]
         );
     }

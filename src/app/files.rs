@@ -1,12 +1,16 @@
-use super::{App, Focus, RightTab};
+use super::{ActiveFileList, App, Focus, RightTab};
 use crate::file_tree::{TreeRow, file_tree_rows};
 use anyhow::Result;
 
 impl App {
     pub(super) fn active_path(&self) -> Option<&str> {
-        self.active_file_index()
-            .and_then(|index| self.files.get(index))
-            .map(|file| file.path.as_str())
+        match self.active_file_list {
+            ActiveFileList::Changed => self
+                .active_file_index()
+                .and_then(|index| self.files.get(index)),
+            ActiveFileList::Ignored => self.ignored_files.get(self.selected_ignored),
+        }
+        .map(|file| file.path.as_str())
     }
 
     pub(super) fn file_tree_rows(&self) -> Vec<TreeRow> {
@@ -22,6 +26,7 @@ impl App {
         let Some(path) = self.files.get(file_index).map(|file| file.path.clone()) else {
             return Ok(());
         };
+        self.active_file_list = ActiveFileList::Changed;
         self.collapsed_dirs.retain(|directory| {
             !path
                 .strip_prefix(directory)
@@ -36,6 +41,24 @@ impl App {
             self.right_tab = RightTab::Diff;
             self.focus_panel(Focus::Right);
             self.rebuild_diff()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn activate_ignored_file(&mut self, file_index: usize) -> Result<()> {
+        if self.ignored_files.get(file_index).is_none() {
+            return Ok(());
+        }
+        self.active_file_list = ActiveFileList::Ignored;
+        self.selected_ignored = file_index;
+        self.rebuild_diff()
+    }
+
+    pub(super) fn select_ignored_file(&mut self, file_index: usize) -> Result<()> {
+        self.activate_ignored_file(file_index)?;
+        if self.active_file_list == ActiveFileList::Ignored {
+            self.right_tab = RightTab::Diff;
+            self.focus_panel(Focus::Right);
         }
         Ok(())
     }
