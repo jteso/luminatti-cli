@@ -1,6 +1,6 @@
 [package]
 name = "luminatti"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A fast, mouse-aware worktree diff review TUI"
 homepage = "https://github.com/jteso/luminatti-cli"
