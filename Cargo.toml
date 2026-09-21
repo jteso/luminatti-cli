@@ -3,6 +3,8 @@ name = "luminatti"
 version = "0.1.0"
 edition = "2024"
 description = "A fast, mouse-aware worktree diff review TUI"
+homepage = "https://github.com/jteso/luminatti-cli"
+repository = "https://github.com/jteso/luminatti-cli"
 license = "MIT"
 
 [[bin]]
@@ -27,3 +29,8 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

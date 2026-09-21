@@ -27,6 +27,17 @@ cargo run --release --bin luminatti -- /path/to/repository
 The target must be inside a Git worktree. Luminatti watches changes by default.
 It never changes source files or `.gitignore`.
 
+## Install with Homebrew
+
+Once a release is published, install Luminatti on macOS with:
+
+```sh
+brew install jteso/tap/luminatti
+```
+
+Maintainers can follow the [release guide](docs/releasing.md) to publish a new
+version and update the formula automatically.
+
 To install the optimized executable globally for your user:
 
 ```sh
