@@ -8,7 +8,7 @@ repository = "https://github.com/jteso/luminatti-cli"
 license = "MIT"
 
 [[bin]]
-name = "luminatti"
+name = "luminatti-cli"
 path = "src/main.rs"
 
 [dependencies]

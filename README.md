@@ -20,8 +20,8 @@ budget, highlighting becomes coarser while all source lines remain available.
 Rendering only styles the visible rows and columns.
 
 ```sh
-cargo run --release --bin luminatti -- .
-cargo run --release --bin luminatti -- /path/to/repository
+cargo run --release --bin luminatti-cli -- .
+cargo run --release --bin luminatti-cli -- /path/to/repository
 ```
 
 The target must be inside a Git worktree. Luminatti watches changes by default.
@@ -32,7 +32,7 @@ It never changes source files or `.gitignore`.
 Once a release is published, install Luminatti on macOS with:
 
 ```sh
-brew install jteso/tap/luminatti
+brew install jteso/tap/luminatti-cli
 ```
 
 Maintainers can follow the [release guide](docs/releasing.md) to publish a new
@@ -44,7 +44,7 @@ To install the optimized executable globally for your user:
 ./install.sh
 ```
 
-This installs `luminatti` to `~/.local/bin` by default. Set `BIN_DIR` or
+This installs `luminatti-cli` to `~/.local/bin` by default. Set `BIN_DIR` or
 `PREFIX` to choose a different location.
 
 ## Keys
@@ -123,8 +123,8 @@ Run the application checks with:
 ```sh
 ./tests/vendored_parser_sources.sh
 cargo fmt --check
-cargo test --bin luminatti --locked
-cargo clippy --bin luminatti --all-targets --no-deps --locked -- -D warnings
+cargo test --bin luminatti-cli --locked
+cargo clippy --bin luminatti-cli --all-targets --no-deps --locked -- -D warnings
 ```
 
 `vendor/difftastic` is the embedded upstream diff engine and is maintained

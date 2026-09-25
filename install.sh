@@ -9,7 +9,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 bin_dir=${BIN_DIR:-"${PREFIX:-"$HOME/.local"}/bin"}
-binary_name=luminatti
+binary_name=luminatti-cli
 target_dir="$script_dir/target"
 
 if ! command -v cargo >/dev/null 2>&1; then

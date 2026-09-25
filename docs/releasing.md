@@ -15,7 +15,7 @@ gh repo create jteso/homebrew-tap --public --add-readme
 Create a fine-grained GitHub personal access token that has **Contents: Read and
 write** access to `jteso/homebrew-tap`. Add it to the `jteso/luminatti-cli`
 repository as the Actions secret `HOMEBREW_TAP_TOKEN`. The release workflow uses
-that secret solely to commit the generated `Formula/luminatti.rb` file to the
+that secret solely to commit the generated `Formula/luminatti-cli.rb` file to the
 tap.
 
 ## Publishing a release
@@ -30,5 +30,5 @@ tap.
 After the workflow succeeds, users install the published version with:
 
 ```sh
-brew install jteso/tap/luminatti
+brew install jteso/tap/luminatti-cli
 ```
